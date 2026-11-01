@@ -21,9 +21,14 @@ func (*notFoundErr) Error() string { return "record not found" }
 // Resolver queries an authoritative server for one zone and walks the object
 // graph: it fetches a manifest, then every chunk, then reassembles and
 // verifies the object. All records are fetched with plain DNS.
+//
+// The suffix selects the label scheme the resolver answers for: "o" for the
+// content-addressed manifest scheme (<id>.o.<zone>) and "g" for the git
+// scheme (<sha>.g.<zone>). A resolver is dedicated to one scheme.
 type Resolver struct {
 	server string
 	zone   Zone
+	suffix string
 	client *dns.Client
 }
 
@@ -33,11 +38,21 @@ func NewResolver(server string, zone Zone, timeout time.Duration) *Resolver {
 	if timeout == 0 {
 		timeout = 5 * time.Second
 	}
-	return &Resolver{server: server, zone: zone, client: &dns.Client{Timeout: timeout, UDPSize: 4096}}
+	return &Resolver{server: server, zone: zone, suffix: "o", client: &dns.Client{Timeout: timeout, UDPSize: 4096}}
 }
 
-// serverAddr returns the resolver's target address.
-func (r *Resolver) serverAddr() string { return r.server }
+// WithObjectSuffix returns the resolver configured to answer the given label
+// scheme. Pass "g" for the git scheme (<sha>.g.<zone>); the default "o" is
+// the content-addressed manifest scheme. The resolver is returned for
+// chaining and is otherwise unchanged.
+func (r *Resolver) WithObjectSuffix(suffix string) *Resolver {
+	// Return an independent copy so the original resolver's suffix is left
+	// unchanged; a caller may keep both the manifest ("o") and git ("g")
+	// resolvers around at once.
+	c := *r
+	c.suffix = suffix
+	return &c
+}
 
 // Fetch resolves the object described by m from the server, using tr for every
 // record, and returns the reassembled bytes. A missing manifest or chunk
@@ -68,7 +83,7 @@ func (r *Resolver) FetchByID(id objectstore.ObjectID, tr objectstore.Transport) 
 // single payload so we trim the padding before parsing. JSON never ends in a
 // null byte, so this is safe.
 func (r *Resolver) resolveManifest(id objectstore.ObjectID, tr objectstore.Transport) (*objectstore.Manifest, error) {
-	raw, err := r.fetch(dns.Fqdn(fmt.Sprintf("%s.o.%s", id, r.zone)), tr)
+	raw, err := r.fetch(dns.Fqdn(fmt.Sprintf("%s.%s.%s", id, r.suffix, r.zone)), tr)
 	if err != nil {
 		return nil, fmt.Errorf("fetch manifest %s: %w", id, err)
 	}
@@ -123,6 +138,22 @@ func (r *Resolver) exchangeTCP(m *dns.Msg) (*dns.Msg, error) {
 		return nil, fmt.Errorf("dnszone: tcp fallback failed: %w", err)
 	}
 	return resp, nil
+}
+
+// FetchRaw fetches the raw bytes stored under <id>.<suffix>.<zone> without
+// interpreting them as a manifest. It is used for the git scheme, whose payload
+// is a raw object rather than a cachemoney manifest, so unlike resolveManifest
+// the bytes are returned verbatim (no JSON parse). AAAA right-pads its final
+// record with null bytes, so that padding is trimmed before returning. id is
+// the bare object id (e.g. a git SHA), not a fully-qualified name.
+func (r *Resolver) FetchRaw(id string, tr objectstore.Transport) ([]byte, error) {
+	raw, err := r.fetch(dns.Fqdn(fmt.Sprintf("%s.%s.%s", id, r.suffix, r.zone)), tr)
+	if err != nil {
+		return nil, fmt.Errorf("dnszone: fetch %s: %w", id, err)
+	}
+	// AAAA right-pads its final record with null bytes; trim the padding back
+	// off so the returned length matches the object. This mirrors resolveManifest.
+	return bytes.TrimRight(raw, "\x00"), nil
 }
 
 // fetch performs one DNS exchange and decodes the answer.

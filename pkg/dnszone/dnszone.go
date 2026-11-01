@@ -89,6 +89,17 @@ func (s *Server) Publish(m *objectstore.Manifest, chunks [][]byte, tr objectstor
 	return nil
 }
 
+// PublishRaw stores a raw payload under the fully-qualified name fqdn using
+// the given transport. Unlike Publish it does not frame a manifest or chunks;
+// it hands the payload straight to the record store. It is the hook the git
+// scheme uses to publish a raw git object under <sha>.g.<zone>.
+func (s *Server) PublishRaw(fqdn string, payload []byte, tr objectstore.Transport) error {
+	if err := s.store(fqdn, payload, tr); err != nil {
+		return fmt.Errorf("dnszone: publish raw %s: %w", fqdn, err)
+	}
+	return nil
+}
+
 // manifestName and chunkName build the fully-qualified names for a manifest
 // and a chunk. The .o / .c suffixes distinguish record kinds and leave room
 // for the .g (git) and .refs schemes without re-addressing existing objects.
@@ -152,24 +163,52 @@ func (s *Server) chunkName(id objectstore.ObjectID) string {
 func (s *Server) Corrupt(id objectstore.ObjectID) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	recs, ok := s.records[s.chunkName(id)]
+	if err := s.corruptRecord(s.chunkName(id)); err != nil {
+		return fmt.Errorf("dnszone: corrupt chunk %s: %w", id, err)
+	}
+	return nil
+}
+
+// Forget removes the record stored under fqdn from the server. It simulates a
+// zone missing an object referenced by a graph (a partial or partially expired
+// zone), so a fetch that needs it fails loudly.
+func (s *Server) Forget(fqdn string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.records, fqdn)
+}
+
+// CorruptAt flips a byte in the first TXT piece of the record stored under the
+// fully-qualified name fqdn, simulating on-the-wire tampering. Unlike Corrupt,
+// it targets an arbitrary name (used to tamper a git object record) rather than
+// a chunk. It is safe for concurrent use and synchronizes with the server's
+// readers via the write lock.
+func (s *Server) CorruptAt(fqdn string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.corruptRecord(fqdn)
+}
+
+// corruptRecord applies the byte flip to the record at fqdn: it flips a bit in
+// the first TXT piece's base64 data (after the ":" separator), never the
+// sequence prefix, so the decoded bytes change and the content hash no longer
+// matches the object.
+func (s *Server) corruptRecord(fqdn string) error {
+	recs, ok := s.records[fqdn]
 	if !ok {
-		return fmt.Errorf("dnszone: no record for chunk %s", id)
+		return fmt.Errorf("no record for %s", fqdn)
 	}
 	txt, ok := recs[0].(*dns.TXT)
 	if !ok {
-		return fmt.Errorf("dnszone: record for chunk %s is not TXT", id)
+		return fmt.Errorf("record for %s is not TXT", fqdn)
 	}
 	if len(txt.Txt) == 0 {
-		return fmt.Errorf("dnszone: no TXT strings for chunk %s", id)
+		return fmt.Errorf("no TXT strings for %s", fqdn)
 	}
 	piece := []byte(txt.Txt[0])
-	// Flip a bit in the base64 data (after the ":" separator), never the
-	// sequence prefix, so the decoded bytes change and the content hash
-	// no longer matches the manifest.
 	ci := bytes.IndexByte(piece, ':')
 	if ci < 0 || ci+1 >= len(piece) {
-		return fmt.Errorf("dnszone: corrupt: cannot locate data in %q", txt.Txt[0])
+		return fmt.Errorf("cannot locate data in %q", txt.Txt[0])
 	}
 	piece[ci+1] ^= 0x01
 	txt.Txt[0] = string(piece)
