@@ -277,3 +277,75 @@ func TestEncodeTXTEmptyPayload(t *testing.T) {
 		t.Fatalf("empty payload round-trip = %d bytes, want 0", len(got))
 	}
 }
+
+// TestReassembleDetectsHashMismatch ensures a chunk whose bytes no longer hash
+// to its manifest id is rejected by the hash check (as opposed to a length
+// mismatch), so any tampering that preserves chunk length is still caught.
+func TestReassembleDetectsHashMismatch(t *testing.T) {
+	data := make([]byte, 3000)
+	if _, err := rand.Read(data); err != nil {
+		t.Fatal(err)
+	}
+	m, chunks := Build(data)
+	if len(m.ChunkIDs) < 2 {
+		t.Fatalf("expected >=2 chunks, got %d", len(m.ChunkIDs))
+	}
+	rebuilt := make(map[ObjectID][]byte)
+	for i, id := range m.ChunkIDs {
+		c := append([]byte{}, chunks[i]...)
+		if i == 0 {
+			c[0] ^= 0xFF // same length, flipped content -> hash no longer matches
+		}
+		rebuilt[id] = c
+	}
+	if _, err := Reassemble(m, rebuilt); err == nil {
+		t.Fatal("expected hash mismatch to fail, got nil")
+	}
+}
+
+// TestReassembleTrimsLongChunk ensures a chunk that is longer than its
+// recorded ChunkLens (as AAAA right-padding can produce) is trimmed to the
+// recorded length before hashing, so the object reassembles correctly rather
+// than failing on the extra padding bytes.
+// TestReassembleSizeMismatch ensures Reassemble rejects a manifest whose
+// TotalSize does not equal the concatenated chunk lengths, even when every
+// chunk's own length and hash are correct.
+func TestReassembleSizeMismatch(t *testing.T) {
+	data := []byte("the quick brown fox jumps over the lazy dog")
+	m, chunks := Build(data)
+	rebuilt := make(map[ObjectID][]byte)
+	for i, id := range m.ChunkIDs {
+		rebuilt[id] = chunks[i]
+	}
+	// Tamper the declared total size so it no longer matches the chunks.
+	m.TotalSize = int64(len(data)) + 1
+	if _, err := Reassemble(m, rebuilt); err == nil {
+		t.Fatal("Reassemble succeeded with a size mismatch, want error")
+	}
+}
+
+func TestReassembleTrimsLongChunk(t *testing.T) {
+	data := make([]byte, 3000)
+	if _, err := rand.Read(data); err != nil {
+		t.Fatal(err)
+	}
+	m, chunks := Build(data)
+	if len(m.ChunkIDs) < 2 {
+		t.Fatalf("expected >=2 chunks, got %d", len(m.ChunkIDs))
+	}
+	rebuilt := make(map[ObjectID][]byte)
+	for i, id := range m.ChunkIDs {
+		c := append([]byte{}, chunks[i]...)
+		if i == 0 {
+			c = append(c, 0x00) // one extra byte -> longer than ChunkLens
+		}
+		rebuilt[id] = c
+	}
+	got, err := Reassemble(m, rebuilt)
+	if err != nil {
+		t.Fatalf("Reassemble with a long chunk: %v", err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("reassembled mismatch: got %d bytes, want %d", len(got), len(data))
+	}
+}

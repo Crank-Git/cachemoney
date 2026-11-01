@@ -126,6 +126,51 @@ func TestFetchDetectsTamper(t *testing.T) {
 	}
 }
 
+// TestFetchDetectsTamperedFile ensures a file whose bytes no longer hash to the
+// index's recorded sha256 is rejected by Verify rather than returned, so a
+// tampered file on the server is caught after the index validates but before
+// the file is used. Corrupting a file (not the index) is what distinguishes it
+// from TestFetchDetectsTamper, which targets the index hash check. Over AAAA a
+// flipped octet changes content without breaking decoding, which is what lands
+// the corruption at Verify rather than at the transport layer (TXT would fail
+// base64 decoding first).
+func TestFetchDetectsTamperedFile(t *testing.T) {
+	// 43-byte content frames into several AAAA records (frame = 47 bytes /
+	// 15 bytes per record = 4 records), so a payload octet can be flipped
+	// without touching the 4-byte length prefix.
+	content := []byte("the quick brown fox jumps over the lazy dog")
+	sum := sha256.Sum256(content)
+	files := map[string][]byte{"/big": content}
+	idx := pkgindex.NewIndex([]pkgindex.Entry{
+		{Path: "/big", Mode: "100644", Size: len(content), SHA256: hex.EncodeToString(sum[:])},
+	})
+
+	srv, rr, shutdown := startServer(t)
+	defer shutdown()
+
+	indexLabel, err := Publish(srv, idx, files, objectstore.AAAA)
+	if err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	entry, err := idx.Lookup("/big")
+	if err != nil {
+		t.Fatalf("lookup: %v", err)
+	}
+	label, err := entry.Label()
+	if err != nil {
+		t.Fatalf("label: %v", err)
+	}
+	fqdn := dns.Fqdn(label + ".f.example.com")
+	// Flip a payload octet on the first record: the 4-byte length prefix lives
+	// at octets 1-4 and the sequence byte at 0, so octet 6 is pure payload.
+	// The frame still decodes to the right length, but the content no longer
+	// hashes to the index, which is what lands the failure at Verify.
+	srv.CorruptAAAA(fqdn)
+	if _, err := Fetch(rr, indexLabel, "/big", objectstore.AAAA); err == nil {
+		t.Fatal("fetch succeeded despite tampered file, want verify error")
+	}
+}
+
 // TestFetchNullTerminatedFile ensures a file whose content ends in a null byte
 // round-trips over AAAA. AAAA right-pads its final record with null bytes, which
 // is ambiguous with content that legitimately ends in a null byte; the framing's
@@ -166,5 +211,62 @@ func TestPublishRejectsMismatch(t *testing.T) {
 
 	if _, err := Publish(srv, idx, files, objectstore.TXT); err == nil {
 		t.Fatal("publish succeeded with mismatched file, want error")
+	}
+}
+
+// TestPublishRejectsMissingFile ensures Publish fails when an index lists a
+// file that is not present in the provided files map, rather than publishing a
+// partial index.
+func TestPublishRejectsMissingFile(t *testing.T) {
+	idx, _ := testIndex()
+	// Drop every file: the index still lists /alpha, /empty, /zeta.
+	srv, _, shutdown := startServer(t)
+	defer shutdown()
+
+	if _, err := Publish(srv, idx, map[string][]byte{}, objectstore.TXT); err == nil {
+		t.Fatal("publish succeeded with missing files, want error")
+	}
+}
+
+// TestPublishRejectsBadEntryLabel ensures Publish fails when an index entry's
+// stored sha256 is not valid hex, so computing its DNS label fails.
+func TestPublishRejectsBadEntryLabel(t *testing.T) {
+	files := map[string][]byte{"/alpha": []byte(helloText)}
+	idx := pkgindex.NewIndex([]pkgindex.Entry{
+		{Path: "/alpha", Mode: "100644", Size: len(helloText), SHA256: "nothex!!"},
+	})
+	srv, _, shutdown := startServer(t)
+	defer shutdown()
+
+	if _, err := Publish(srv, idx, files, objectstore.TXT); err == nil {
+		t.Fatal("publish succeeded with bad entry label, want error")
+	}
+}
+
+// TestFetchMissingFile ensures Fetch fails when the requested file was never
+// published, rather than returning unverified data. The full index is
+// published, then the target record is forgotten from the server so the
+// resolver returns a not-found.
+func TestFetchMissingFile(t *testing.T) {
+	idx, files := testIndex()
+	srv, rr, shutdown := startServer(t)
+	defer shutdown()
+
+	if _, err := Publish(srv, idx, files, objectstore.TXT); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	// Remove the /zeta record from the server so the fetch cannot find it.
+	zeta, err := idx.Lookup("/zeta")
+	if err != nil {
+		t.Fatalf("lookup /zeta: %v", err)
+	}
+	label, err := zeta.Label()
+	if err != nil {
+		t.Fatalf("label /zeta: %v", err)
+	}
+	srv.Forget(dns.Fqdn(label + ".f.example.com"))
+
+	if _, err := Fetch(rr, idx.Label(), "/zeta", objectstore.TXT); err == nil {
+		t.Fatal("fetch succeeded for unpublished file, want error")
 	}
 }
