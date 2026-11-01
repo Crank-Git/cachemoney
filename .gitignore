@@ -24,6 +24,9 @@ coverage.out
 /.env
 *.local
 
+# Local runbooks
+/docs/live-dns-runbook.md
+
 # Editor / OS
 .DS_Store
 .idea/

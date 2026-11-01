@@ -50,7 +50,12 @@ A client walks the graph:
 
 ```
 pkg/objectstore/   content-addressed core: chunking, manifests, TXT/AAAA framing, verify
-cmd/cachemoney/    CLI (build a store, resolve an object by id)
+pkg/dnszone/       authoritative server (serve) + client resolver (fetch) over UDP/TCP
+pkg/gitobj/        Git object model (commit/tree/blob hashing, graph walk)
+pkg/gitdns/        publish/fetch Git object graphs over DNS
+pkg/pkgindex/      package-file index model
+pkg/mirror/        apt/Nix binary-cache mirror over DNS
+cmd/cachemoney/    CLI (`put`/`get` a local store, `serve` an authoritative server, `fetch` over DNS)
 .github/workflows/ CI (build, gofmt, unit + integration tests, vet, coverage)
 ```
 
@@ -83,19 +88,27 @@ feature ──► dev ──► main
 
 See [CONTRIBUTING.md](./CONTRIBUTING.md) for the full workflow.
 
-## Roadmap
+## Status
+
+All planned work is complete:
 
 1. **Object store core** ✅ — chunking, manifests, TXT/AAAA framing, verification.
-2. **Authoritative DNS layer** — serve these records from a real nameserver.
-3. **Client resolver** — walk the graph over DoH/DoT, parallel fetch, caching.
-4. **Git over DNS** — `git-remote-dns` helper; `git clone` over DNS.
-5. **Package caches** — apt / Nix binary cache mirror over DNS.
+2. **Authoritative DNS layer** ✅ — in-memory nameserver (`serve`) and client resolver (`fetch`) over UDP/TCP.
+3. **Client resolver** ✅ — walks the object graph over DNS with EDNS0 + TCP fallback for truncated answers.
+4. **Git over DNS** ✅ — `gitobj` model and `gitdns` publish/fetch of Git object graphs.
+5. **Package caches** ✅ — `pkgindex` model and `mirror` apt/Nix binary-cache mirror.
+
+## Future work
+
+- Parallel / concurrent fetch to keep latency down under many in-flight queries.
+- DoH/DoT transports in addition to plain DNS.
+- Resolver-side caching for hot objects.
+- A `git-remote-dns` helper so `git clone` works over DNS.
+- Which TLD/zone hosts the records, and how contributors publish authoritatively.
 
 ## Open questions
 
 - Chunk size vs. UDP/EDNS limits; exact TXT vs. AAAA split.
-- TCP fallback behavior when an answer is truncated.
-- Parallel fetch strategy (many in-flight queries) to keep latency down.
 - Which TLD/zone hosts the records, and how contributors publish authoritatively.
 - Manifest serialization (JSON now; possibly CBOR later for size).
 
