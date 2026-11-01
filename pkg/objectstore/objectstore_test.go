@@ -3,9 +3,35 @@ package objectstore
 import (
 	"bytes"
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/json"
 	"testing"
 )
+
+// TestUnmarshalManifest ensures manifest bytes round-trip through the parser
+// and that invalid JSON is rejected. It is how LoadStore turns a stored
+// manifest file back into a Manifest.
+func TestUnmarshalManifest(t *testing.T) {
+	data := []byte("round-trip the manifest through its own parser")
+	m, _ := Build(data)
+	b, err := m.Bytes()
+	if err != nil {
+		t.Fatalf("Bytes: %v", err)
+	}
+	back, err := UnmarshalManifest(b)
+	if err != nil {
+		t.Fatalf("UnmarshalManifest: %v", err)
+	}
+	if back.Version != m.Version || back.TotalSize != m.TotalSize || back.ChunkCount != m.ChunkCount {
+		t.Fatalf("scalar fields changed: %+v vs %+v", back, m)
+	}
+	if len(back.ChunkIDs) != len(m.ChunkIDs) || len(back.ChunkLens) != len(m.ChunkLens) {
+		t.Fatalf("chunk slices changed: %d/%d vs %d/%d", len(back.ChunkIDs), len(back.ChunkLens), len(m.ChunkIDs), len(m.ChunkLens))
+	}
+	if _, err := UnmarshalManifest([]byte("not json")); err == nil {
+		t.Fatal("invalid JSON accepted, want error")
+	}
+}
 
 func TestContentAddressedSameInputSameID(t *testing.T) {
 	m1, _ := Build([]byte("hello world"))
@@ -178,4 +204,76 @@ func mustDecodeTXT(t *testing.T, recs []string) []byte {
 		t.Fatalf("decode: %v", err)
 	}
 	return p
+}
+
+// TestReassembleChunkTooShort ensures a present-but-short chunk is rejected
+// before the hash check, so a truncated chunk fails loudly rather than
+// silently shortening the reassembled payload.
+func TestReassembleChunkTooShort(t *testing.T) {
+	data := make([]byte, 3000)
+	if _, err := rand.Read(data); err != nil {
+		t.Fatal(err)
+	}
+	m, chunks := Build(data)
+	if len(m.ChunkIDs) < 2 {
+		t.Fatalf("expected >=2 chunks, got %d", len(m.ChunkIDs))
+	}
+	// Trim the first chunk below its recorded length.
+	short := chunks[0][:m.ChunkLens[0]-1]
+	rebuilt := map[ObjectID][]byte{m.ChunkIDs[0]: short, m.ChunkIDs[1]: chunks[1]}
+	if _, err := Reassemble(m, rebuilt); err == nil {
+		t.Fatal("expected too-short chunk to fail, got nil")
+	}
+}
+
+// TestDecodeAAAAErrorBranches exercises every DecodeAAAA failure path: a record
+// too short to carry a sequence byte, an empty answer, a payload too short to
+// hold the length prefix, and a length prefix that exceeds the data.
+func TestDecodeAAAAErrorBranches(t *testing.T) {
+	if _, err := DecodeAAAA([][]byte{{0x00}}); err == nil {
+		t.Error("DecodeAAAA: single byte record, want error")
+	}
+	if _, err := DecodeAAAA([][]byte{}); err == nil {
+		t.Error("DecodeAAAA: empty answer, want error")
+	}
+	// 2 bytes total -> payload is 1 byte, too short for the 4-byte length prefix.
+	if _, err := DecodeAAAA([][]byte{{0x00, 0x00}}); err == nil {
+		t.Error("DecodeAAAA: payload too short for length prefix, want error")
+	}
+	// Length prefix claims 100 bytes but only 2 are present.
+	bad := make([]byte, 6)
+	binary.BigEndian.PutUint32(bad[:4], 100)
+	if _, err := DecodeAAAA([][]byte{bad}); err == nil {
+		t.Error("DecodeAAAA: length exceeds available, want error")
+	}
+}
+
+// TestDecodeTXTErrorBranches exercises every DecodeTXT failure path: a record
+// with no sequence separator, a non-numeric sequence, and an empty answer.
+func TestDecodeTXTErrorBranches(t *testing.T) {
+	if _, err := DecodeTXT([]string{"noseparator"}); err == nil {
+		t.Error("DecodeTXT: record without ':' separator, want error")
+	}
+	if _, err := DecodeTXT([]string{"notanum:Zm9v"}); err == nil {
+		t.Error("DecodeTXT: non-numeric sequence, want error")
+	}
+	if _, err := DecodeTXT(nil); err == nil {
+		t.Error("DecodeTXT: empty answer, want error")
+	}
+}
+
+// TestEncodeTXTEmptyPayload documents that an empty payload encodes to a single
+// "0:" record and round-trips back to empty rather than to nil or padding.
+func TestEncodeTXTEmptyPayload(t *testing.T) {
+	recs := EncodeTXT(Frame{Index: 0, Payload: nil})
+	if len(recs) != 1 || recs[0] != "0:" {
+		t.Fatalf("empty payload encode = %v, want [0:]", recs)
+	}
+	got, err := DecodeTXT(recs)
+	if err != nil {
+		t.Fatalf("decode empty: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("empty payload round-trip = %d bytes, want 0", len(got))
+	}
 }
