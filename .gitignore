@@ -1,0 +1,29 @@
+# Binaries
+/dist/
+/cachemoney
+/cachemoney.exe
+*.test
+*.out
+
+# Go
+/vendor/
+*.exe
+*.exe.dll
+*.dll
+*.so
+*.dylib
+doc/html/
+*.pc
+
+# Test / coverage
+coverage.txt
+coverage.html
+
+# Local dev
+/.env
+*.local
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/

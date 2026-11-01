@@ -1,0 +1,36 @@
+name: test
+
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+    branches: [dev, main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.27'
+
+      - name: Build
+        run: go build ./...
+
+      - name: Format (gofmt)
+        run: test -z "$(gofmt -l $(find . -name '*.go' -not -path './vendor/*'))" && echo "gofmt clean"
+
+      - name: Test
+        run: go test -race -coverprofile=coverage.out ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Coverage gate
+        run: |
+          total=$(go tool cover -func=coverage.out | tail -n 1 | awk '{split($3,a,"%"); print a[1]}')
+          echo "total coverage: ${total}%"
+          awk -v t="$total" 'BEGIN{ if (t+0 < 70) { print "coverage below 70%"; exit 1 } }'
