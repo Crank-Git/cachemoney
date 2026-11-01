@@ -289,6 +289,17 @@ func (s *Server) handle(w dns.ResponseWriter, req *dns.Msg) {
 			m.Answer = append(m.Answer, recs...)
 		}
 	}
+	// Truncate UDP answers to fit within the client's advertised UDP buffer so a
+	// response too large for a single UDP datagram is split with the TC bit set;
+	// the resolver uses TC to fall back to TCP (RFC 1035). Without truncation the
+	// oversized datagram is fragmented and dropped on the wire. TCP answers are
+	// length-prefixed and must never be truncated, so detect the network via the
+	// peer address (UDP -> *net.UDPAddr, TCP -> *net.TCPAddr).
+	if _, isTCP := w.RemoteAddr().(*net.TCPAddr); !isTCP {
+		if opt := req.IsEdns0(); opt != nil {
+			m.Truncate(int(opt.UDPSize()))
+		}
+	}
 	_ = w.WriteMsg(m)
 }
 
