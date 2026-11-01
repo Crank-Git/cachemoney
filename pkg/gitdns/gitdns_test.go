@@ -148,6 +148,25 @@ func TestFetchMissingObject(t *testing.T) {
 	}
 }
 
+// TestPublishRejectsCorruptSource ensures Publish fails when the source graph
+// is corrupt, so Walk rejects it before publishing a half-built index.
+func TestPublishRejectsCorruptSource(t *testing.T) {
+	objects, commitSHA, _, _ := buildGraph(t)
+	fetch := func(sha string) ([]byte, error) {
+		if sha == commitSHA {
+			// A blob's bytes presented under the commit's name: ReadObject
+			// parses it but its content address will not match the requested
+			// SHA, so Walk rejects the corrupt object.
+			return rawBytes(gitobj.Blob, []byte("hello")), nil
+		}
+		return objects[sha], nil
+	}
+	srv, _ := gitServer(t)
+	if err := Publish(srv, commitSHA, fetch, objectstore.TXT); err == nil {
+		t.Fatal("Publish succeeded with a corrupt source, want error")
+	}
+}
+
 func TestFetchDetectsTampering(t *testing.T) {
 	// Tampering is exercised over TXT via Server.Corrupt, which flips a byte in
 	// a stored record's first piece and is only defined for TXT answers.

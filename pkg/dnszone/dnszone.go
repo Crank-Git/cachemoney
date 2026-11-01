@@ -293,6 +293,17 @@ func (s *Server) handle(w dns.ResponseWriter, req *dns.Msg) {
 }
 
 // Shutdown stops the server and releases its ports.
+// CorruptAAAA flips a payload octet in the first AAAA record at fqdn so the
+// decoded content no longer matches its hash, letting tests exercise corruption
+// detection. It is intended for tests and panics if the record is missing or
+// not an AAAA record (publishers know the transport they used).
+func (s *Server) CorruptAAAA(fqdn string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rec := s.records[fqdn][0].(*dns.AAAA)
+	rec.AAAA[6] ^= 0x01
+}
+
 func (s *Server) Shutdown() {
 	if s.srv != nil {
 		_ = s.srv.Shutdown()

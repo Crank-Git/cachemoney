@@ -2,6 +2,8 @@ package pkgindex
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"testing"
 )
 
@@ -168,5 +170,55 @@ func TestMalformed(t *testing.T) {
 		if _, err := ParseIndex(raw); err == nil {
 			t.Errorf("case %d: malformed input accepted, want error", i)
 		}
+	}
+}
+
+// TestEntryLabelBadHex covers the branch where an entry's stored sha256 is not
+// valid hex, so decoding it in Label fails.
+func TestEntryLabelBadHex(t *testing.T) {
+	e := Entry{Mode: "100644", Size: 6, SHA256: "nothex!!"}
+	if _, err := e.Label(); err == nil {
+		t.Fatal("non-hex sha256 accepted, want error")
+	}
+}
+
+// TestParseIndexTruncatedHeader covers the branch where a header spans the
+// whole input with no trailing newline, so no entry terminator is found.
+func TestParseIndexTruncatedHeader(t *testing.T) {
+	raw := []byte("100644 6 " + shaHello) // no newline, no path
+	if _, err := ParseIndex(raw); err == nil {
+		t.Fatal("truncated header accepted, want error")
+	}
+}
+
+// TestSplitHeaderNoSpace ensures splitHeader fails when a header has no space
+// separator, so a malformed header index entry is rejected.
+func TestSplitHeaderNoSpace(t *testing.T) {
+	if _, _, _, ok := splitHeader([]byte("nospace")); ok {
+		t.Fatal("splitHeader with no space accepted, want failure")
+	}
+}
+
+// TestSplitHeaderNoSecondSpace ensures splitHeader rejects a header that has a
+// mode and a single space but no size/sha — the second failure path (after a
+// header with no space at all).
+func TestSplitHeaderNoSecondSpace(t *testing.T) {
+	if _, _, _, ok := splitHeader([]byte("100644 onlyone")); ok {
+		t.Fatal("splitHeader with a single space accepted, want failure")
+	}
+}
+
+// TestVerifySizeMismatch ensures Verify rejects content whose hash matches the
+// entry but whose length does not match the recorded size.
+func TestVerifySizeMismatch(t *testing.T) {
+	content := []byte("hello world")
+	sum := sha256.Sum256(content)
+	idx := NewIndex([]Entry{{
+		Path:   "/alpha",
+		Size:   len(content) + 1, // correct hash, wrong size
+		SHA256: hex.EncodeToString(sum[:]),
+	}})
+	if _, err := idx.Verify("/alpha", content); err == nil {
+		t.Fatal("Verify succeeded with a size mismatch, want error")
 	}
 }
