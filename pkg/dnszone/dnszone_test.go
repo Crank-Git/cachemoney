@@ -61,6 +61,38 @@ func TestEndToEndRoundTrip(t *testing.T) {
 	}
 }
 
+// TestEndToEndTruncateAAAA exercises the resolver's TCP fallback: a single
+// large chunk whose AAAA encoding exceeds the 4 KB EDNS0 buffer forces the
+// server to truncate the UDP answer, so the resolver re-issues over TCP.
+func TestEndToEndTruncateAAAA(t *testing.T) {
+	srv, res, shutdown := newTestServer(t, objectstore.AAAA)
+	defer shutdown()
+
+	// A single ~3 KB chunk: its AAAA encoding (15 payload bytes per 16-byte
+	// record) is 201 records, so the UDP answer exceeds the 4 KB EDNS0 buffer
+	// and the server truncates it (setting the TC bit); the resolver then
+	// re-issues over TCP. The chunk stays under 256 records so the 1-byte
+	// sequence number in each AAAA record does not overflow.
+	data := randBytes(3000)
+	m := &objectstore.Manifest{
+		Version:    objectstore.ManifestVersion,
+		TotalSize:  int64(len(data)),
+		ChunkCount: 1,
+		ChunkIDs:   []objectstore.ObjectID{objectstore.ChunkID(data)},
+		ChunkLens:  []int64{int64(len(data))},
+	}
+	if err := srv.Publish(m, [][]byte{data}, objectstore.AAAA); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	got, err := res.Fetch(m, objectstore.AAAA)
+	if err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("round-trip mismatch: got %d bytes, want %d", len(got), len(data))
+	}
+}
+
 // TestEndToEndMissing ensures a missing object fails loudly over DNS.
 func TestEndToEndMissing(t *testing.T) {
 	srv, res, shutdown := newTestServer(t, objectstore.TXT)

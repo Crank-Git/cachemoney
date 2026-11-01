@@ -111,6 +111,12 @@ func (r *Resolver) walk(m *objectstore.Manifest, tr objectstore.Transport) ([]by
 // exchange performs one DNS query, falling back to TCP if the UDP answer is
 // truncated (which happens for large AAAA sets). UDP is preferred for latency.
 func (r *Resolver) exchange(m *dns.Msg) (*dns.Msg, error) {
+	// Advertise a 4 KB UDP buffer via EDNS0 so the server can return a large
+	// answer in one datagram and, when it cannot, truncate and set the TC bit
+	// that drives the TCP fallback below. Without EDNS0 a query falls back to
+	// the 512-byte historic limit and the oversized response fragments on the
+	// wire instead of arriving with the truncation bit set.
+	m.SetEdns0(4096, false)
 	resp, _, err := r.client.Exchange(m, r.server)
 	if err != nil {
 		// A UDP answer larger than our buffer yields dns.ErrBuf from the
