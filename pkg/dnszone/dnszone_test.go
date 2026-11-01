@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"testing"
 
+	"github.com/miekg/dns"
+
 	"github.com/Crank-Git/cachemoney/pkg/objectstore"
 )
 
@@ -99,4 +101,66 @@ func randBytes(n int) []byte {
 	b := make([]byte, n)
 	_, _ = rand.Read(b)
 	return b
+}
+
+// TestGitSchemeRawRoundTrip exercises the raw-record path the git scheme uses:
+// a resolver configured with the ".g" suffix, a payload published under a
+// custom fully-qualified name, and fetched back verbatim. It also covers
+// Forget (a missing record) and CorruptAt (on-the-wire tampering).
+func TestGitSchemeRawRoundTrip(t *testing.T) {
+	for _, tr := range []objectstore.Transport{objectstore.TXT, objectstore.AAAA} {
+		tr := tr
+		t.Run("transport="+strconv.Itoa(int(tr)), func(t *testing.T) {
+			srv, res, shutdown := newTestServer(t, tr)
+			defer shutdown()
+
+			// A git-scheme resolver answers <id>.g.<zone>, not <id>.o.<zone>.
+			git := res.WithObjectSuffix("g")
+
+			id := "b6fc4c620b67d95f953a5c1c1230aaab5db5a1b0"
+			want := []byte("raw git object bytes, not a manifest")
+			fqdn := dns.Fqdn(id + ".g.example.com")
+
+			if err := srv.PublishRaw(fqdn, want, tr); err != nil {
+				t.Fatalf("publish raw: %v", err)
+			}
+
+			got, err := git.FetchRaw(id, tr)
+			if err != nil {
+				t.Fatalf("fetch raw: %v", err)
+			}
+			if !bytes.Equal(got, want) {
+				t.Fatalf("raw round-trip mismatch: got %q, want %q", got, want)
+			}
+
+			// The default suffix must NOT find the git record.
+			if _, err := res.FetchRaw(id, tr); err == nil {
+				t.Fatal("default resolver found a .g record, want suffix isolation")
+			}
+
+			// Forget removes the record; the fetch then fails.
+			srv.Forget(fqdn)
+			if _, err := git.FetchRaw(id, tr); err == nil {
+				t.Fatal("fetch succeeded after Forget, want not-found")
+			}
+
+			// Re-publish and tamper; CorruptAt flips a byte in a TXT piece, so it
+			// only applies to the TXT transport.
+			if tr == objectstore.TXT {
+				if err := srv.PublishRaw(fqdn, want, tr); err != nil {
+					t.Fatalf("re-publish raw: %v", err)
+				}
+				if err := srv.CorruptAt(fqdn); err != nil {
+					t.Fatalf("corrupt at: %v", err)
+				}
+				got, err = git.FetchRaw(id, tr)
+				if err != nil {
+					t.Fatalf("fetch raw after corrupt: %v", err)
+				}
+				if bytes.Equal(got, want) {
+					t.Fatal("corrupt had no effect, want differing bytes")
+				}
+			}
+		})
+	}
 }
