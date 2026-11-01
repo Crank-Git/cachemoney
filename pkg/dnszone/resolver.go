@@ -41,23 +41,50 @@ func (r *Resolver) serverAddr() string { return r.server }
 
 // Fetch resolves the object described by m from the server, using tr for every
 // record, and returns the reassembled bytes. A missing manifest or chunk
-// fails loudly rather than returning truncated data.
+// fails loudly rather than returning truncated data. The passed-in manifest is
+// only used for its id: the manifest is re-fetched and re-verified from the
+// server so a caller cannot pass a manifest that disagrees with the wire.
 func (r *Resolver) Fetch(m *objectstore.Manifest, tr objectstore.Transport) ([]byte, error) {
-	raw, err := r.fetch(dns.Fqdn(fmt.Sprintf("%s.o.%s", m.ID(), r.zone)), tr)
+	check, err := r.resolveManifest(m.ID(), tr)
 	if err != nil {
-		return nil, fmt.Errorf("fetch manifest %s: %w", m.ID(), err)
+		return nil, err
 	}
-	// AAAA right-pads its final record with null bytes; the manifest is a
-	// single payload so we trim the padding before parsing. JSON never ends
-	// in a null byte, so this is safe.
-	raw = bytes.TrimRight(raw, "\x00")
-	check, err := objectstore.UnmarshalManifest(raw)
-	if err != nil {
-		return nil, fmt.Errorf("parse manifest %s: %w", m.ID(), err)
-	}
+	return r.walk(check, tr)
+}
 
-	chunks := make(map[objectstore.ObjectID][]byte, len(check.ChunkIDs))
-	for _, id := range check.ChunkIDs {
+// FetchByID resolves the manifest for id from the server, then walks its chunks
+// and returns the reassembled, verified object. It is the entry point when you
+// have an object id but not its manifest bytes (as the CLI fetch command does).
+func (r *Resolver) FetchByID(id objectstore.ObjectID, tr objectstore.Transport) ([]byte, error) {
+	check, err := r.resolveManifest(id, tr)
+	if err != nil {
+		return nil, err
+	}
+	return r.walk(check, tr)
+}
+
+// resolveManifest fetches and parses the manifest for the given id from the
+// server. AAAA right-pads its final record with null bytes; the manifest is a
+// single payload so we trim the padding before parsing. JSON never ends in a
+// null byte, so this is safe.
+func (r *Resolver) resolveManifest(id objectstore.ObjectID, tr objectstore.Transport) (*objectstore.Manifest, error) {
+	raw, err := r.fetch(dns.Fqdn(fmt.Sprintf("%s.o.%s", id, r.zone)), tr)
+	if err != nil {
+		return nil, fmt.Errorf("fetch manifest %s: %w", id, err)
+	}
+	raw = bytes.TrimRight(raw, "\x00")
+	m, err := objectstore.UnmarshalManifest(raw)
+	if err != nil {
+		return nil, fmt.Errorf("parse manifest %s: %w", id, err)
+	}
+	return m, nil
+}
+
+// walk fetches every chunk of m, reassembles it, and verifies every hash. A
+// missing or tampered chunk fails loudly rather than returning truncated data.
+func (r *Resolver) walk(m *objectstore.Manifest, tr objectstore.Transport) ([]byte, error) {
+	chunks := make(map[objectstore.ObjectID][]byte, len(m.ChunkIDs))
+	for _, id := range m.ChunkIDs {
 		name := dns.Fqdn(fmt.Sprintf("%s.c.%s", id, r.zone))
 		c, err := r.fetch(name, tr)
 		if err != nil {
@@ -65,7 +92,7 @@ func (r *Resolver) Fetch(m *objectstore.Manifest, tr objectstore.Transport) ([]b
 		}
 		chunks[id] = c
 	}
-	return objectstore.Reassemble(check, chunks)
+	return objectstore.Reassemble(m, chunks)
 }
 
 // exchange performs one DNS query, falling back to TCP if the UDP answer is
