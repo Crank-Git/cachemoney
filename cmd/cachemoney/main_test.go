@@ -59,6 +59,33 @@ func TestPutGetRoundTrip(t *testing.T) {
 	}
 }
 
+// TestPutWritesIDToOutFlag ensures the -out flag writes the object id and that
+// the id written is the one used to retrieve the object.
+func TestPutWritesIDToOutFlag(t *testing.T) {
+	dir := t.TempDir()
+	store := filepath.Join(dir, "store")
+	in := filepath.Join(dir, "input.bin")
+	outID := filepath.Join(dir, "id.txt")
+	payload := []byte("write the id to the out flag")
+	if err := os.WriteFile(in, payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"put", "-store", store, "-out", outID, in}); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	got, err := os.ReadFile(outID)
+	if err != nil {
+		t.Fatalf("read -out: %v", err)
+	}
+	if len(got) == 0 {
+		t.Fatal("empty id written to -out")
+	}
+	// The id written to -out must be the one that retrieves the object.
+	if err := run([]string{"get", "-store", store, string(objectstore.ObjectID(got))}); err != nil {
+		t.Fatalf("get by -out id: %v", err)
+	}
+}
+
 func TestGetDetectsTampering(t *testing.T) {
 	dir := t.TempDir()
 	store := filepath.Join(dir, "store")
@@ -193,6 +220,17 @@ func TestServeBadTransport(t *testing.T) {
 	err := run([]string{"serve", "-tr", "smtptls"})
 	if err == nil {
 		t.Fatal("expected serve to fail on an unknown transport, got nil")
+	}
+}
+
+// TestRunDispatch covers the run-level error paths: no command, and an unknown
+// command, both of which must fail before dispatching to a subcommand.
+func TestRunDispatch(t *testing.T) {
+	if err := run(nil); err == nil {
+		t.Fatal("run with no args accepted, want usage error")
+	}
+	if err := run([]string{"bogus"}); err == nil {
+		t.Fatal("run with unknown command accepted, want error")
 	}
 }
 

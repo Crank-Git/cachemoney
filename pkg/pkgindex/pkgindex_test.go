@@ -101,6 +101,61 @@ func TestDuplicatesCollapsed(t *testing.T) {
 	}
 }
 
+// TestIndexLabel pins the base32 DNS label for an index's content hash. A raw
+// sha256 hex is 64 chars, over the 63-char DNS label limit; base32 encodes it
+// down to ~52. The value is cross-checked against sha256sum on the host.
+func TestIndexLabel(t *testing.T) {
+	idx := NewIndex([]Entry{
+		{Path: "/alpha", Mode: "100644", Size: len(helloContent), SHA256: shaHello},
+	})
+	label := idx.Label()
+	want := "XP6DX2QFQUITVFTCVJYSFJFOBVSKUBR5XHKT3CAJAYEABV4C7MOA"
+	if label != want {
+		t.Fatalf("Label = %q, want %q", label, want)
+	}
+	if len(label) > 63 {
+		t.Fatalf("label %q is %d chars, exceeds the 63-char DNS limit", label, len(label))
+	}
+	if len(idx.Hash()) != 64 {
+		t.Fatalf("Hash = %q, want 64 hex chars", idx.Hash())
+	}
+}
+
+// TestEntryLabel pins the base32 DNS label for a single file's content hash and
+// confirms the bad-sha error path.
+func TestEntryLabel(t *testing.T) {
+	e := Entry{Mode: "100644", Size: 6, SHA256: shaHello}
+	label, err := e.Label()
+	want := "LCI3LNJC2XPQQ3IP6CYRB66Z2IN3J7DRMOXTJUECQ2ROQRXWXYBQ"
+	if err != nil {
+		t.Fatalf("Label: %v", err)
+	}
+	if label != want {
+		t.Fatalf("Label = %q, want %q", label, want)
+	}
+	empty := Entry{}
+	if _, err := empty.Label(); err == nil {
+		t.Fatal("empty sha256 accepted, want error")
+	}
+}
+
+// TestLookup ensures a known path returns its entry and an unknown path errors.
+func TestLookup(t *testing.T) {
+	idx := NewIndex([]Entry{
+		{Path: "/alpha", Mode: "100644", Size: len(helloContent), SHA256: shaHello},
+	})
+	e, err := idx.Lookup("/alpha")
+	if err != nil {
+		t.Fatalf("Lookup: %v", err)
+	}
+	if e.Path != "/alpha" || e.SHA256 != shaHello {
+		t.Fatalf("Lookup returned %+v, want /alpha/%s", e, shaHello)
+	}
+	if _, err := idx.Lookup("/missing"); err == nil {
+		t.Fatal("unknown path accepted, want not-found")
+	}
+}
+
 // TestMalformed ensures ParseIndex rejects malformed input.
 func TestMalformed(t *testing.T) {
 	bad := [][]byte{

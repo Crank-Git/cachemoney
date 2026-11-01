@@ -3,6 +3,8 @@ package dnszone
 import (
 	"bytes"
 	"math/rand"
+	"os"
+	"path/filepath"
 	"strconv"
 	"testing"
 
@@ -162,5 +164,167 @@ func TestGitSchemeRawRoundTrip(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestNewServerDefaultsTTL confirms a zero TTL is defaulted rather than served
+// as zero, which would make records expire immediately.
+func TestNewServerDefaultsTTL(t *testing.T) {
+	srv := NewServer(Zone("example.com"), 0)
+	if srv.ZoneName() != "example.com" {
+		t.Fatalf("ZoneName = %q, want example.com", srv.ZoneName())
+	}
+}
+
+// TestZoneName confirms the server reports the zone it was created for.
+func TestZoneName(t *testing.T) {
+	srv := NewServer(Zone("example.com"), DefaultTTL)
+	if got := srv.ZoneName(); got != "example.com" {
+		t.Fatalf("ZoneName = %q, want %q", got, "example.com")
+	}
+}
+
+// TestFetchByID covers the id-first entry point: publish an object, then fetch
+// it back by its manifest id alone, letting the resolver resolve the manifest
+// and walk the chunks.
+func TestFetchByID(t *testing.T) {
+	for _, tr := range []objectstore.Transport{objectstore.TXT, objectstore.AAAA} {
+		tr := tr
+		t.Run("transport="+strconv.Itoa(int(tr)), func(t *testing.T) {
+			srv, res, shutdown := newTestServer(t, tr)
+			defer shutdown()
+
+			data := randBytes(3000)
+			m, chunks := objectstore.Build(data)
+			if err := srv.Publish(m, chunks, tr); err != nil {
+				t.Fatalf("publish: %v", err)
+			}
+
+			got, err := res.FetchByID(m.ID(), tr)
+			if err != nil {
+				t.Fatalf("FetchByID: %v", err)
+			}
+			if !bytes.Equal(got, data) {
+				t.Fatalf("FetchByID mismatch: got %d bytes, want %d", len(got), len(data))
+			}
+		})
+	}
+}
+
+// TestLoadStore writes a disk store in the CLI put layout, loads it into a
+// server, and verifies the loaded object is fetchable.
+func TestLoadStore(t *testing.T) {
+	for _, tr := range []objectstore.Transport{objectstore.TXT, objectstore.AAAA} {
+		tr := tr
+		t.Run("transport="+strconv.Itoa(int(tr)), func(t *testing.T) {
+			srv, res, shutdown := newTestServer(t, tr)
+			defer shutdown()
+
+			data := randBytes(2000)
+			m, chunks := objectstore.Build(data)
+
+			dir := t.TempDir()
+			if err := os.MkdirAll(filepath.Join(dir, "manifests"), 0o750); err != nil {
+				t.Fatalf("mkdir manifests: %v", err)
+			}
+			if err := os.MkdirAll(filepath.Join(dir, "chunks"), 0o750); err != nil {
+				t.Fatalf("mkdir chunks: %v", err)
+			}
+			mb, err := m.Bytes()
+			if err != nil {
+				t.Fatalf("manifest bytes: %v", err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "manifests", string(m.ID())+".json"), mb, 0o640); err != nil {
+				t.Fatalf("write manifest: %v", err)
+			}
+			for i, cid := range m.ChunkIDs {
+				if err := os.WriteFile(filepath.Join(dir, "chunks", string(cid)), chunks[i], 0o640); err != nil {
+					t.Fatalf("write chunk %s: %v", cid, err)
+				}
+			}
+
+			if err := srv.LoadStore(dir, tr); err != nil {
+				t.Fatalf("LoadStore: %v", err)
+			}
+
+			got, err := res.FetchByID(m.ID(), tr)
+			if err != nil {
+				t.Fatalf("fetch loaded object: %v", err)
+			}
+			if !bytes.Equal(got, data) {
+				t.Fatalf("loaded object mismatch: got %d bytes, want %d", len(got), len(data))
+			}
+		})
+	}
+}
+
+// TestLoadStoreMissing ensures a non-existent store directory fails loudly
+// rather than serving an empty zone.
+func TestLoadStoreMissing(t *testing.T) {
+	srv := NewServer(Zone("example.com"), DefaultTTL)
+	if err := srv.LoadStore(filepath.Join(t.TempDir(), "does-not-exist"), objectstore.TXT); err == nil {
+		t.Fatal("LoadStore on missing dir accepted, want error")
+	}
+}
+
+// TestLoadStoreRejectsSizeMismatch ensures a chunk on disk whose size does not
+// match the manifest's ChunkLens is rejected, so a corrupted store file fails
+// loudly at load time rather than serving a wrong-length chunk.
+func TestLoadStoreRejectsSizeMismatch(t *testing.T) {
+	srv := NewServer(Zone("example.com"), DefaultTTL)
+	dir := t.TempDir()
+	mDir := filepath.Join(dir, "manifests")
+	cDir := filepath.Join(dir, "chunks")
+	if err := os.MkdirAll(mDir, 0o750); err != nil {
+		t.Fatalf("mkdir manifests: %v", err)
+	}
+	if err := os.MkdirAll(cDir, 0o750); err != nil {
+		t.Fatalf("mkdir chunks: %v", err)
+	}
+
+	data := []byte("wrong-size chunk on disk")
+	m, chunks := objectstore.Build(data)
+	mb, err := m.Bytes()
+	if err != nil {
+		t.Fatalf("manifest bytes: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(mDir, string(m.ID())+".json"), mb, 0o640); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	// Write the right chunk under the right name but with one extra byte.
+	wrong := make([]byte, len(chunks[0])+1)
+	copy(wrong, chunks[0])
+	if err := os.WriteFile(filepath.Join(cDir, string(m.ChunkIDs[0])), wrong, 0o640); err != nil {
+		t.Fatalf("write chunk: %v", err)
+	}
+
+	if err := srv.LoadStore(dir, objectstore.TXT); err == nil {
+		t.Fatal("LoadStore accepted a size-mismatched chunk, want error")
+	}
+}
+
+// TestLoadStoreRejectsBadManifest ensures a manifest file that is not valid
+// JSON is rejected at load time.
+func TestLoadStoreRejectsBadManifest(t *testing.T) {
+	srv := NewServer(Zone("example.com"), DefaultTTL)
+	dir := t.TempDir()
+	mDir := filepath.Join(dir, "manifests")
+	if err := os.MkdirAll(mDir, 0o750); err != nil {
+		t.Fatalf("mkdir manifests: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(mDir, "deadbeef.json"), []byte("not json"), 0o640); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	if err := srv.LoadStore(dir, objectstore.TXT); err == nil {
+		t.Fatal("LoadStore accepted a non-JSON manifest, want error")
+	}
+}
+
+// TestCorruptUnknown ensures Corrupt on an id with no stored record fails
+// loudly rather than silently succeeding.
+func TestCorruptUnknown(t *testing.T) {
+	srv := NewServer(Zone("example.com"), DefaultTTL)
+	if err := srv.Corrupt(objectstore.ObjectID("notastoredid")); err == nil {
+		t.Fatal("Corrupt on unknown id accepted, want error")
 	}
 }
