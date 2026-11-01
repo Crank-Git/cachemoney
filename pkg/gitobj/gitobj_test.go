@@ -1,0 +1,279 @@
+package gitobj
+
+import (
+	"fmt"
+	"testing"
+)
+
+// Known-good reference values produced by `git hash-object` / `git mktree`.
+const (
+	refHello  = "b6fc4c620b67d95f953a5c1c1230aaab5db5a1b0"
+	refWorld  = "04fea06420ca60892f73becee3614f6d023a4b7f"
+	refEmpty  = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
+	refTree1  = "65829399355e5929e44741d637d52c614ac21bc3"
+	refTree2  = "e30b5202a91c72788d1ce94a3918edb647d2f48c"
+	refEmptyT = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+)
+
+// rawBytes wraps content in the canonical Git object framing:
+// "<kind> <size>\x00<content>".
+func rawBytes(kind Kind, content []byte) []byte {
+	return append([]byte(fmt.Sprintf("%s %d\x00", kind, len(content))), content...)
+}
+
+func TestObjectSHAMatchesGit(t *testing.T) {
+	cases := []struct {
+		kind  Kind
+		input string
+		want  string
+	}{
+		{Blob, "", refEmpty},
+		{Blob, "hello", refHello},
+		{Blob, "world", refWorld},
+	}
+	for _, c := range cases {
+		if got := ObjectSHA(c.kind, []byte(c.input)); got != c.want {
+			t.Errorf("ObjectSHA(%q, %q) = %s, want %s", c.kind, c.input, got, c.want)
+		}
+	}
+}
+
+func TestMarshalTreeMatchesGit(t *testing.T) {
+	one := []Entry{{Mode: "100644", Name: "a.txt", SHA: refHello}}
+	SortEntries(one)
+	if got := ObjectSHA(Tree, MarshalTree(one)); got != refTree1 {
+		t.Errorf("single-tree sha = %s, want %s", got, refTree1)
+	}
+
+	// Two blobs, fed in reverse order to exercise SortEntries.
+	two := []Entry{
+		{Mode: "100644", Name: "b.txt", SHA: refWorld},
+		{Mode: "100644", Name: "a.txt", SHA: refHello},
+	}
+	SortEntries(two)
+	if got := ObjectSHA(Tree, MarshalTree(two)); got != refTree2 {
+		t.Errorf("two-tree sha = %s, want %s", got, refTree2)
+	}
+
+	if got := ObjectSHA(Tree, MarshalTree(nil)); got != refEmptyT {
+		t.Errorf("empty-tree sha = %s, want %s", got, refEmptyT)
+	}
+}
+
+// TestSortEntriesMatchesGit pins Git's tree-entry ordering against
+// `git hash-object -t tree`: entries sort by name, tree (directory) names are
+// treated as if they had a trailing '/', and the comparison is case-sensitive
+// (bytewise). Each case is fed in a deliberately wrong order so SortEntries is
+// exercised; the resulting SHA must equal Git's canonical value.
+func TestSortEntriesMatchesGit(t *testing.T) {
+	emptyTree := "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+	cases := []struct {
+		name string
+		// fed in deliberately unsorted order;
+		in   []Entry
+		want string
+	}{
+		{
+			name: "mixed-modes",
+			in: []Entry{
+				{Mode: "100755", Name: "ascript.sh", SHA: "01f02e32ce8a128dd7b1d16a45f2eff66ec23c2d"},
+				{Mode: "100644", Name: "afile.txt", SHA: "7c4a013e52c76442ab80ee5572399a30373600a2"},
+				{Mode: "40000", Name: "adir", SHA: emptyTree},
+			},
+			want: "6c05c27f44df725371a396d0b39f4e1a42033690",
+		},
+		{
+			name: "case-sensitive",
+			// fed scrambled; canonical order is Foo/, Zebra, apple, foo.txt
+			in: []Entry{
+				{Mode: "100644", Name: "apple", SHA: "2e65efe2a145dda7ee51d1741299f848e5bf752e"},
+				{Mode: "100644", Name: "foo.txt", SHA: "e25f1814e51579d5f55c0f1fe0135ddb28a47f4a"},
+				{Mode: "100644", Name: "Zebra", SHA: "fa7af8bf5fdd704f73beb3adc5612682a98e1af5"},
+				{Mode: "40000", Name: "Foo", SHA: emptyTree},
+			},
+			want: "82dfe77ae2313f37a3a2036b889b3f9d3167e47c",
+		},
+		{
+			name: "trailing-slash",
+			in: []Entry{
+				{Mode: "40000", Name: "foo", SHA: emptyTree},
+				{Mode: "100644", Name: "foobar", SHA: "4d1ae35ba2c8ec712fa2a379db44ad639ca277bd"},
+				{Mode: "100644", Name: "foo.txt", SHA: "e25f1814e51579d5f55c0f1fe0135ddb28a47f4a"},
+			},
+			want: "e28af8bb697971d205204b59d028a24c4607ec23",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			SortEntries(c.in)
+			got := ObjectSHA(Tree, MarshalTree(c.in))
+			if got != c.want {
+				t.Errorf("sorted tree sha = %s, want %s", got, c.want)
+			}
+		})
+	}
+}
+
+func TestParseTreeRoundTrip(t *testing.T) {
+	raw := MarshalTree([]Entry{
+		{Mode: "100644", Name: "a.txt", SHA: refHello},
+		{Mode: "100644", Name: "b.txt", SHA: refWorld},
+	})
+	got, err := ParseTree(raw)
+	if err != nil {
+		t.Fatalf("ParseTree: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d entries, want 2", len(got))
+	}
+	if got[0].Name != "a.txt" || got[1].Name != "b.txt" {
+		t.Errorf("order not canonical: %q, %q", got[0].Name, got[1].Name)
+	}
+	for i, want := range []string{refHello, refWorld} {
+		if got[i].SHA != want {
+			t.Errorf("entry %d sha = %q, want %q", i, got[i].SHA, want)
+		}
+	}
+}
+
+func TestReadObjectCommit(t *testing.T) {
+	content := []byte("tree " + refTree2 + "\nauthor Test <test@example.com> 1700000000 +0000\ncommitter Test <test@example.com> 1700000000 +0000\n\nFirst commit\n")
+	raw := rawBytes(Commit, content)
+
+	o, err := ReadObject(raw)
+	if err != nil {
+		t.Fatalf("ReadObject: %v", err)
+	}
+	if o.Kind != Commit {
+		t.Errorf("kind = %q, want commit", o.Kind)
+	}
+	if o.SHA != ObjectSHA(Commit, content) {
+		t.Errorf("sha mismatch")
+	}
+	if o.Tree != refTree2 {
+		t.Errorf("tree = %q, want %q", o.Tree, refTree2)
+	}
+	if o.Author != "Test <test@example.com> 1700000000 +0000" {
+		t.Errorf("author = %q", o.Author)
+	}
+	if o.Message != "First commit\n" {
+		t.Errorf("message = %q", o.Message)
+	}
+}
+
+func TestReadObjectRejectsBadSize(t *testing.T) {
+	if _, err := ReadObject(rawBytes(Blob, []byte("hello"))); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Corrupt the recorded size so it no longer matches the content length.
+	bad := append([]byte("blob 999\x00"), []byte("hello")...)
+	if _, err := ReadObject(bad); err == nil {
+		t.Fatal("expected size mismatch error")
+	}
+}
+
+func TestWalk(t *testing.T) {
+	tree := MarshalTree([]Entry{
+		{Mode: "100644", Name: "a.txt", SHA: refHello},
+		{Mode: "100644", Name: "b.txt", SHA: refWorld},
+	})
+	commit := []byte("tree " + refTree2 + "\nauthor A <a@example.com> 1700000000 +0000\ncommitter A <a@example.com> 1700000000 +0000\n\nroot\n")
+	commitSHA := ObjectSHA(Commit, commit)
+
+	store := map[string][]byte{
+		commitSHA: rawBytes(Commit, commit),
+		refTree2:  rawBytes(Tree, tree),
+		refHello:  rawBytes(Blob, []byte("hello")),
+		refWorld:  rawBytes(Blob, []byte("world")),
+	}
+
+	fetch := func(sha string) ([]byte, error) {
+		raw, ok := store[sha]
+		if !ok {
+			return nil, fmt.Errorf("object %s not found", sha)
+		}
+		return raw, nil
+	}
+
+	objects, err := Walk(fetch, commitSHA)
+	if err != nil {
+		t.Fatalf("Walk: %v", err)
+	}
+	if len(objects) != 4 {
+		t.Fatalf("walked %d objects, want 4 (commit, tree, 2 blobs)", len(objects))
+	}
+	for sha := range store {
+		if _, ok := objects[sha]; !ok {
+			t.Errorf("object %s not reached by walk", sha)
+		}
+	}
+}
+
+func TestWalkDetectsTampering(t *testing.T) {
+	commit := []byte("tree " + refTree1 + "\nauthor A <a@example.com> 1700000000 +0000\ncommitter A <a@example.com> 1700000000 +0000\n\nroot\n")
+	commitSHA := ObjectSHA(Commit, commit)
+
+	store := map[string][]byte{
+		commitSHA: rawBytes(Commit, commit),
+		refTree1:  rawBytes(Tree, MarshalTree([]Entry{{Mode: "100644", Name: "a.txt", SHA: refHello}})),
+		refHello:  rawBytes(Blob, []byte("HELLO")), // content no longer matches refHello
+		refWorld:  rawBytes(Blob, []byte("world")),
+	}
+
+	_, err := Walk(func(sha string) ([]byte, error) {
+		return store[sha], nil
+	}, commitSHA)
+	if err == nil {
+		t.Fatal("expected tampering error")
+	}
+}
+
+func TestWalkFollowsParents(t *testing.T) {
+	// Two commits sharing one tree: commit2 -> commit1 (parent) -> tree -> blob.
+	tree := MarshalTree([]Entry{{Mode: "100644", Name: "a.txt", SHA: refHello}})
+	commit1 := []byte("tree " + refTree1 + "\nauthor A <a@example.com> 1700000000 +0000\ncommitter A <a@example.com> 1700000000 +0000\n\nfirst\n")
+	commit1SHA := ObjectSHA(Commit, commit1)
+	commit2 := []byte("tree " + refTree1 + "\nparent " + commit1SHA + "\nauthor A <a@example.com> 1700000001 +0000\ncommitter A <a@example.com> 1700000001 +0000\n\nsecond\n")
+	commit2SHA := ObjectSHA(Commit, commit2)
+
+	store := map[string][]byte{
+		commit2SHA: rawBytes(Commit, commit2),
+		commit1SHA: rawBytes(Commit, commit1),
+		refTree1:   rawBytes(Tree, tree),
+		refHello:   rawBytes(Blob, []byte("hello")),
+	}
+
+	objects, err := Walk(func(sha string) ([]byte, error) {
+		return store[sha], nil
+	}, commit2SHA)
+	if err != nil {
+		t.Fatalf("Walk: %v", err)
+	}
+	if len(objects) != 4 {
+		t.Fatalf("walked %d objects, want 4 (2 commits, 1 tree, 1 blob)", len(objects))
+	}
+	if _, ok := objects[commit1SHA]; !ok {
+		t.Error("parent commit not reached")
+	}
+}
+
+func TestWalkDetectsMissingParent(t *testing.T) {
+	commit1 := []byte("tree " + refTree1 + "\nauthor A <a@example.com> 1700000000 +0000\ncommitter A <a@example.com> 1700000000 +0000\n\nfirst\n")
+	commit1SHA := ObjectSHA(Commit, commit1)
+	commit2 := []byte("tree " + refTree1 + "\nparent " + commit1SHA + "\nauthor A <a@example.com> 1700000001 +0000\ncommitter A <a@example.com> 1700000001 +0000\n\nsecond\n")
+	commit2SHA := ObjectSHA(Commit, commit2)
+
+	// commit1 is absent from the store.
+	store := map[string][]byte{
+		commit2SHA: rawBytes(Commit, commit2),
+		refTree1:   rawBytes(Tree, MarshalTree([]Entry{{Mode: "100644", Name: "a.txt", SHA: refHello}})),
+		refHello:   rawBytes(Blob, []byte("hello")),
+	}
+
+	_, err := Walk(func(sha string) ([]byte, error) {
+		return store[sha], nil
+	}, commit2SHA)
+	if err == nil {
+		t.Fatal("expected error for missing parent")
+	}
+}
