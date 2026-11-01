@@ -15,14 +15,6 @@ type DNSStore struct {
 	chunks    map[ObjectID][]any
 }
 
-// Transport selects how payloads are framed on the way in and out.
-type Transport int
-
-const (
-	TXT Transport = iota
-	AAAA
-)
-
 func NewDNSStore(t Transport) *DNSStore {
 	return &DNSStore{transport: t, manifests: map[ObjectID][]any{}, chunks: map[ObjectID][]any{}}
 }

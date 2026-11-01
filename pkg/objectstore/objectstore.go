@@ -38,6 +38,17 @@ const (
 	AAAAPayloadPerRecord = 15
 )
 
+// Transport selects how a chunk or manifest is framed for DNS. TXT uses
+// character-strings; AAAA packs raw payload into 16-byte addresses.
+type Transport int
+
+const (
+	// TXT frames payloads as DNS TXT character-strings.
+	TXT Transport = iota
+	// AAAA frames payloads as DNS AAAA addresses.
+	AAAA
+)
+
 // b32 is lowercase, unpadded base32 (RFC 4648). A SHA-256 hash -> ~51 chars,
 // which fits inside the 63-char DNS label limit (hex would be 64).
 var b32 = base32.StdEncoding.WithPadding(base32.NoPadding)
@@ -135,10 +146,26 @@ type Frame struct {
 // reassembled by sequence number.
 func EncodeTXT(f Frame) []string {
 	enc := base64.StdEncoding.EncodeToString(f.Payload)
-	pieces := splitInto(enc, TXTCharStrMax)
-	out := make([]string, len(pieces))
-	for i, p := range pieces {
-		out[i] = strconv.Itoa(i) + ":" + p
+	out := make([]string, 0, len(enc)/TXTCharStrMax+1)
+	for i := 0; len(enc) > 0; i++ {
+		seq := strconv.Itoa(i)
+		// The "<seq>:" prefix counts toward the 255-byte limit, so cap the
+		// piece at whatever room remains for this sequence number. room stays
+		// positive for any realistic payload (a room of 0 would need a
+		// 254-digit sequence number).
+		room := TXTCharStrMax - len(seq) - 1
+		if room < 1 {
+			room = 1
+		}
+		piece := enc
+		if len(piece) > room {
+			piece = piece[:room]
+		}
+		out = append(out, seq+":"+piece)
+		enc = enc[len(piece):]
+	}
+	if len(out) == 0 {
+		return []string{"0:"}
 	}
 	return out
 }
@@ -248,23 +275,4 @@ func Reassemble(m *Manifest, chunks map[ObjectID][]byte) ([]byte, error) {
 		return nil, fmt.Errorf("objectstore: size mismatch (manifest %d, got %d)", m.TotalSize, len(out))
 	}
 	return out, nil
-}
-
-// splitInto splits s into pieces of at most max runes.
-func splitInto(s string, max int) []string {
-	if max <= 0 {
-		max = TXTCharStrMax
-	}
-	var out []string
-	for i := 0; i < len(s); i += max {
-		end := i + max
-		if end > len(s) {
-			end = len(s)
-		}
-		out = append(out, s[i:end])
-	}
-	if len(out) == 0 {
-		out = []string{""}
-	}
-	return out
 }

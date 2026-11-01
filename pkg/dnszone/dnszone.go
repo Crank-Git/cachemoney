@@ -1,0 +1,215 @@
+// Package dnszone bridges the content-addressed objectstore and the wire: it
+// publishes objects as DNS records on a real authoritative server and resolves
+// them back with a real DNS client. An object is framed exactly as the
+// objectstore specifies and handed to miekg/dns; a client fetches the records
+// and reassembles them exactly as a resolver would return them.
+//
+// This is the second spike of the project. The label scheme (which suffix
+// identifies a chunk vs. a manifest, which zone hosts the records) is a
+// working model to iterate on — see the README "Open questions".
+package dnszone
+
+import (
+	"bytes"
+	"fmt"
+	"net"
+	"strconv"
+	"sync"
+
+	"github.com/miekg/dns"
+
+	"github.com/Crank-Git/cachemoney/pkg/objectstore"
+)
+
+// Zone is the apex DNS name served by a Server, e.g. "example.com".
+type Zone string
+
+// DefaultTTL is how long records may be cached, in seconds. Immutable objects
+// can live a long time; refs are expected to be short-lived in production.
+const DefaultTTL uint32 = 300
+
+// Server is a minimal authoritative DNS server for one zone. It holds records
+// in memory, keyed by fully-qualified name, and answers every query from that
+// map. It exists to demonstrate the end-to-end path; a production server would
+// load records from disk or a backend.
+type Server struct {
+	zone    Zone
+	ttl     uint32
+	mu      sync.RWMutex
+	records map[string][]dns.RR
+	srv     *dns.Server
+	srvTCP  *dns.Server
+}
+
+// NewServer creates a server for zone. ttl overrides the default if > 0.
+func NewServer(zone Zone, ttl uint32) *Server {
+	if ttl == 0 {
+		ttl = DefaultTTL
+	}
+	return &Server{
+		zone:    zone,
+		ttl:     ttl,
+		records: make(map[string][]dns.RR),
+	}
+}
+
+// ZoneName returns the zone this server is authoritative for.
+func (s *Server) ZoneName() string { return string(s.zone) }
+
+// Port returns the actual listening port (useful when started on :0).
+func (s *Server) Port() int {
+	if s.srv != nil && s.srv.PacketConn != nil {
+		if ua, ok := s.srv.PacketConn.LocalAddr().(*net.UDPAddr); ok {
+			return ua.Port
+		}
+	}
+	return 0
+}
+
+// Publish frames an already-built object into the zone. The manifest is
+// served at <id>.o.<zone> and each chunk at <chunkid>.c.<zone>, using the
+// given transport for every record.
+func (s *Server) Publish(m *objectstore.Manifest, chunks [][]byte, tr objectstore.Transport) error {
+	mb, err := m.Bytes()
+	if err != nil {
+		return fmt.Errorf("marshal manifest: %w", err)
+	}
+	if err := s.store(s.manifestName(m.ID()), mb, tr); err != nil {
+		return fmt.Errorf("publish manifest: %w", err)
+	}
+	for i, c := range chunks {
+		id := m.ChunkIDs[i]
+		if err := s.store(s.chunkName(id), c, tr); err != nil {
+			return fmt.Errorf("publish chunk %s: %w", id, err)
+		}
+	}
+	return nil
+}
+
+// manifestName and chunkName build the fully-qualified names for a manifest
+// and a chunk. The .o / .c suffixes distinguish record kinds and leave room
+// for the .g (git) and .refs schemes without re-addressing existing objects.
+func (s *Server) manifestName(id objectstore.ObjectID) string {
+	return dns.Fqdn(fmt.Sprintf("%s.o.%s", id, s.zone))
+}
+
+func (s *Server) chunkName(id objectstore.ObjectID) string {
+	return dns.Fqdn(fmt.Sprintf("%s.c.%s", id, s.zone))
+}
+
+// Corrupt flips a byte in the first TXT piece of a chunk's record, simulating
+// on-the-wire tampering. It is safe for concurrent use and synchronizes with
+// the server's readers via the write lock.
+func (s *Server) Corrupt(id objectstore.ObjectID) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	recs, ok := s.records[s.chunkName(id)]
+	if !ok {
+		return fmt.Errorf("dnszone: no record for chunk %s", id)
+	}
+	txt, ok := recs[0].(*dns.TXT)
+	if !ok {
+		return fmt.Errorf("dnszone: record for chunk %s is not TXT", id)
+	}
+	if len(txt.Txt) == 0 {
+		return fmt.Errorf("dnszone: no TXT strings for chunk %s", id)
+	}
+	piece := []byte(txt.Txt[0])
+	// Flip a bit in the base64 data (after the ":" separator), never the
+	// sequence prefix, so the decoded bytes change and the content hash
+	// no longer matches the manifest.
+	ci := bytes.IndexByte(piece, ':')
+	if ci < 0 || ci+1 >= len(piece) {
+		return fmt.Errorf("dnszone: corrupt: cannot locate data in %q", txt.Txt[0])
+	}
+	piece[ci+1] ^= 0x01
+	txt.Txt[0] = string(piece)
+	return nil
+}
+
+// store records a payload under fqdn using the given transport.
+func (s *Server) store(fqdn string, payload []byte, tr objectstore.Transport) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	switch tr {
+	case objectstore.TXT:
+		pieces := objectstore.EncodeTXT(objectstore.Frame{Payload: payload})
+		s.records[fqdn] = []dns.RR{&dns.TXT{
+			Hdr: dns.RR_Header{Name: fqdn, Rrtype: dns.TypeTXT, Class: dns.ClassINET, Ttl: s.ttl},
+			Txt: pieces,
+		}}
+	case objectstore.AAAA:
+		addrs := objectstore.EncodeAAAA(objectstore.Frame{Payload: payload})
+		rrs := make([]dns.RR, 0, len(addrs))
+		for _, a := range addrs {
+			rrs = append(rrs, &dns.AAAA{
+				Hdr:  dns.RR_Header{Name: fqdn, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: s.ttl},
+				AAAA: net.IP(a),
+			})
+		}
+		s.records[fqdn] = rrs
+	default:
+		return fmt.Errorf("objectstore: unknown transport %d", tr)
+	}
+	return nil
+}
+
+// Start binds UDP and TCP on a shared ephemeral port (use "127.0.0.1:0") and
+// begins answering queries in the background. It blocks until both listeners
+// are ready, so Port() returns a usable address on return.
+func (s *Server) Start(addr string) error {
+	// Discover a free port so UDP and TCP can share one address (the resolver
+	// uses a single server address for both transports).
+	pc, err := net.ListenPacket("udp", addr)
+	if err != nil {
+		return fmt.Errorf("dnszone: discover port: %w", err)
+	}
+	ua := pc.LocalAddr().(*net.UDPAddr)
+	_ = pc.Close()
+	listenAt := net.JoinHostPort(ua.IP.String(), strconv.Itoa(ua.Port))
+
+	mux := dns.NewServeMux()
+	mux.HandleFunc(".", s.handle)
+
+	var started sync.WaitGroup
+	started.Add(2)
+	// Use a larger UDP buffer (enables EDNS0) so manifests and multi-record
+	// AAAA sets fit in a single UDP answer without truncation.
+	udp := &dns.Server{Addr: listenAt, Net: "udp", Handler: mux, NotifyStartedFunc: func() { started.Done() }, UDPSize: 4096}
+	tcp := &dns.Server{Addr: listenAt, Net: "tcp", Handler: mux, NotifyStartedFunc: func() { started.Done() }, UDPSize: 4096}
+	go func() { _ = udp.ListenAndServe() }()
+	go func() { _ = tcp.ListenAndServe() }()
+	started.Wait()
+
+	s.srv = udp
+	s.srvTCP = tcp
+	return nil
+}
+
+// handle answers a single query from the in-memory record map. Unknown names
+// yield NODATA (an empty answer), which a client treats as not-found.
+func (s *Server) handle(w dns.ResponseWriter, req *dns.Msg) {
+	m := new(dns.Msg)
+	m.SetReply(req)
+	m.Authoritative = true
+	// Hold the read lock while copying the answer so a concurrent Publish
+	// cannot mutate the slice we are appending to.
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, q := range req.Question {
+		if recs, ok := s.records[q.Name]; ok {
+			m.Answer = append(m.Answer, recs...)
+		}
+	}
+	_ = w.WriteMsg(m)
+}
+
+// Shutdown stops the server and releases its ports.
+func (s *Server) Shutdown() {
+	if s.srv != nil {
+		_ = s.srv.Shutdown()
+	}
+	if s.srvTCP != nil {
+		_ = s.srvTCP.Shutdown()
+	}
+}
