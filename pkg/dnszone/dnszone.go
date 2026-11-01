@@ -13,7 +13,10 @@ import (
 	"bytes"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/miekg/dns"
@@ -89,6 +92,52 @@ func (s *Server) Publish(m *objectstore.Manifest, chunks [][]byte, tr objectstor
 // manifestName and chunkName build the fully-qualified names for a manifest
 // and a chunk. The .o / .c suffixes distinguish record kinds and leave room
 // for the .g (git) and .refs schemes without re-addressing existing objects.
+// LoadStore loads objects from a local store directory into the in-memory
+// record set, framed with tr. The layout matches the CLI put command:
+//
+//	<dir>/manifests/<id>.json   raw manifest bytes
+//	<dir>/chunks/<chunkid>      raw chunk bytes
+//
+// The manifest is stored as its raw JSON so it round-trips through
+// UnmarshalManifest unchanged; every chunk is re-hashed on the way in, so a
+// corrupted store file is rejected before the server starts serving it.
+func (s *Server) LoadStore(dir string, tr objectstore.Transport) error {
+	mDir, cDir := filepath.Join(dir, "manifests"), filepath.Join(dir, "chunks")
+	entries, err := os.ReadDir(mDir)
+	if err != nil {
+		return fmt.Errorf("dnszone: load manifests: %w", err)
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		mb, err := os.ReadFile(filepath.Join(mDir, e.Name()))
+		if err != nil {
+			return fmt.Errorf("dnszone: read manifest %s: %w", e.Name(), err)
+		}
+		m, err := objectstore.UnmarshalManifest(mb)
+		if err != nil {
+			return fmt.Errorf("dnszone: parse manifest %s: %w", e.Name(), err)
+		}
+		if err := s.store(s.manifestName(m.ID()), mb, tr); err != nil {
+			return fmt.Errorf("dnszone: store manifest %s: %w", m.ID(), err)
+		}
+		for i, cid := range m.ChunkIDs {
+			cb, err := os.ReadFile(filepath.Join(cDir, string(cid)))
+			if err != nil {
+				return fmt.Errorf("dnszone: read chunk %s: %w", cid, err)
+			}
+			if int64(len(cb)) != m.ChunkLens[i] {
+				return fmt.Errorf("dnszone: chunk %s size mismatch (manifest %d, got %d)", cid, m.ChunkLens[i], len(cb))
+			}
+			if err := s.store(s.chunkName(cid), cb, tr); err != nil {
+				return fmt.Errorf("dnszone: store chunk %s: %w", cid, err)
+			}
+		}
+	}
+	return nil
+}
+
 func (s *Server) manifestName(id objectstore.ObjectID) string {
 	return dns.Fqdn(fmt.Sprintf("%s.o.%s", id, s.zone))
 }

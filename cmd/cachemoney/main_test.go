@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
+	"github.com/Crank-Git/cachemoney/pkg/dnszone"
 	"github.com/Crank-Git/cachemoney/pkg/objectstore"
 )
 
@@ -95,4 +97,123 @@ func TestGetMissingObject(t *testing.T) {
 		t.Fatal("expected missing-object error, got nil")
 	}
 	_ = dir
+}
+
+// startServingServer loads dir into an in-memory DNS server on an ephemeral
+// port and returns it, ready to serve. The caller's test cleans it up.
+func startServingServer(t *testing.T, dir string, tr objectstore.Transport) *dnszone.Server {
+	t.Helper()
+	srv := dnszone.NewServer(dnszone.Zone("example.com"), 0)
+	if err := srv.LoadStore(dir, tr); err != nil {
+		t.Fatalf("load store: %v", err)
+	}
+	if err := srv.Start("127.0.0.1:0"); err != nil {
+		t.Fatalf("start server: %v", err)
+	}
+	t.Cleanup(func() { srv.Shutdown() })
+	return srv
+}
+
+// TestServeFetchOverDNS writes an object to a local store, loads that store
+// into an authoritative DNS server, and resolves the object back over the wire
+// for both transports. It exercises the full put -> serve -> fetch path.
+func TestServeFetchOverDNS(t *testing.T) {
+	cases := []struct {
+		name      string
+		transport objectstore.Transport
+	}{
+		{"txt", objectstore.TXT},
+		{"aaaa", objectstore.AAAA},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			store := filepath.Join(dir, "store")
+			in := filepath.Join(dir, "input.bin")
+			out := filepath.Join(dir, "output.bin")
+
+			// A multi-chunk payload so the AAAA TCP fallback path runs.
+			payload := bytes.Repeat([]byte("cachemoney-over-dns-"), 400) // 9600 bytes, ~10 chunks
+			if err := os.WriteFile(in, payload, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := run([]string{"put", "-store", store, in}); err != nil {
+				t.Fatalf("put: %v", err)
+			}
+			id := findObjectID(t, store)
+
+			srv := startServingServer(t, store, tc.transport)
+			addr := "127.0.0.1:" + strconv.Itoa(srv.Port())
+
+			if err := run([]string{"fetch", "-addr", addr, "-tr", tc.name, "-out", out, string(id)}); err != nil {
+				t.Fatalf("fetch: %v", err)
+			}
+			got, err := os.ReadFile(out)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, payload) {
+				t.Fatalf("round-trip mismatch: got %d bytes, want %d", len(got), len(payload))
+			}
+		})
+	}
+}
+
+// TestFetchOverDNSMissing ensures a fetch for an unknown id fails over DNS.
+func TestFetchOverDNSMissing(t *testing.T) {
+	dir := t.TempDir()
+	store := filepath.Join(dir, "store")
+	// Populate the store with an unrelated object so the server has records.
+	in := filepath.Join(dir, "input.bin")
+	if err := os.WriteFile(in, []byte("something else"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"put", "-store", store, in}); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	srv := startServingServer(t, store, objectstore.TXT)
+	addr := "127.0.0.1:" + strconv.Itoa(srv.Port())
+
+	err := run([]string{"fetch", "-addr", addr, "-out", filepath.Join(dir, "out"), "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"})
+	if err == nil {
+		t.Fatal("expected not-found error over DNS, got nil")
+	}
+}
+
+// TestServeBadStore ensures serve fails loudly when the store cannot be loaded.
+func TestServeBadStore(t *testing.T) {
+	err := run([]string{"serve", "-store", filepath.Join("does", "not", "exist")})
+	if err == nil {
+		t.Fatal("expected serve to fail on a missing store, got nil")
+	}
+}
+
+// TestServeBadTransport ensures serve rejects an unknown transport flag.
+func TestServeBadTransport(t *testing.T) {
+	err := run([]string{"serve", "-tr", "smtptls"})
+	if err == nil {
+		t.Fatal("expected serve to fail on an unknown transport, got nil")
+	}
+}
+
+// TestParseTransport covers the transport flag parser directly.
+func TestParseTransport(t *testing.T) {
+	wantOK := map[string]objectstore.Transport{
+		"txt":  objectstore.TXT,
+		"":     objectstore.TXT,
+		"aaaa": objectstore.AAAA,
+		"AAAA": objectstore.AAAA,
+	}
+	for in, want := range wantOK {
+		got, err := parseTransport(in)
+		if err != nil {
+			t.Fatalf("parseTransport(%q): unexpected error %v", in, err)
+		}
+		if got != want {
+			t.Fatalf("parseTransport(%q): got %v, want %v", in, got, want)
+		}
+	}
+	if _, err := parseTransport("nope"); err == nil {
+		t.Fatal("expected error for unknown transport")
+	}
 }
