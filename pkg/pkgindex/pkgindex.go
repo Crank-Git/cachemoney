@@ -19,6 +19,8 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+
+	"github.com/Crank-Git/cachemoney/pkg/objectstore"
 )
 
 // Entry is one file listed in the index: its path within the package, its
@@ -57,11 +59,18 @@ func NewIndex(entries []Entry) *Index {
 	return &Index{Entries: sorted}
 }
 
-// Hash returns the sha256 of the index's canonical bytes. It lets the index
-// itself be content-addressed and served like any other object.
+// Hash returns the hex sha256 of the index's canonical bytes. It lets the
+// index itself be content-addressed and served like any other object.
 func (i *Index) Hash() string {
 	sum := sha256.Sum256(i.Marshal())
 	return hex.EncodeToString(sum[:])
+}
+
+// Label returns the base32 DNS label for the index's content hash. A SHA-256
+// hash is 64 hex chars, which exceeds the 63-char label limit; base32 encodes
+// it to ~51. This is what the DNS transport uses to address the index.
+func (i *Index) Label() string {
+	return objectstore.ToLabel(sha256.Sum256(i.Marshal()))
 }
 
 // Marshal serializes the index into canonical bytes: entries sorted by path,
@@ -128,6 +137,34 @@ func splitHeader(header []byte) (mode, size, sha string, ok bool) {
 	size = string(rest[:second])
 	sha = string(rest[second+1:])
 	return mode, size, sha, true
+}
+
+// Lookup returns the entry for path, or an error if the path is unknown. It is
+// the pre-fetch lookup a mirror uses to learn a file's expected hash before it
+// fetches the file.
+func (i *Index) Lookup(path string) (*Entry, error) {
+	for _, e := range i.Entries {
+		if e.Path == path {
+			return &e, nil
+		}
+	}
+	return nil, fmt.Errorf("pkgindex: no entry for %s", path)
+}
+
+// Label returns the base32 DNS label for this entry's content hash, decoding
+// the stored hex sha256. It is what the DNS transport uses to address the
+// file; the hex form stored in SHA256 stays human- and tool-checkable.
+func (e *Entry) Label() (string, error) {
+	raw, err := hex.DecodeString(e.SHA256)
+	if err != nil {
+		return "", fmt.Errorf("pkgindex: bad sha256 %q: %w", e.SHA256, err)
+	}
+	if len(raw) != sha256.Size {
+		return "", fmt.Errorf("pkgindex: sha256 %q is not %d bytes", e.SHA256, sha256.Size)
+	}
+	var sum [sha256.Size]byte
+	copy(sum[:], raw)
+	return objectstore.ToLabel(sum), nil
 }
 
 // Verify looks up path in the index and checks that content matches the listed

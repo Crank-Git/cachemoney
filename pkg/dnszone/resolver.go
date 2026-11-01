@@ -1,7 +1,6 @@
 package dnszone
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"time"
@@ -79,15 +78,14 @@ func (r *Resolver) FetchByID(id objectstore.ObjectID, tr objectstore.Transport) 
 }
 
 // resolveManifest fetches and parses the manifest for the given id from the
-// server. AAAA right-pads its final record with null bytes; the manifest is a
-// single payload so we trim the padding before parsing. JSON never ends in a
-// null byte, so this is safe.
+// server. The framing (DecodeTXT/DecodeAAAA) returns the payload exactly: the
+// AAAA length prefix disambiguates the right-padding of the final record from
+// content, so nothing is trimmed.
 func (r *Resolver) resolveManifest(id objectstore.ObjectID, tr objectstore.Transport) (*objectstore.Manifest, error) {
 	raw, err := r.fetch(dns.Fqdn(fmt.Sprintf("%s.%s.%s", id, r.suffix, r.zone)), tr)
 	if err != nil {
 		return nil, fmt.Errorf("fetch manifest %s: %w", id, err)
 	}
-	raw = bytes.TrimRight(raw, "\x00")
 	m, err := objectstore.UnmarshalManifest(raw)
 	if err != nil {
 		return nil, fmt.Errorf("parse manifest %s: %w", id, err)
@@ -143,17 +141,15 @@ func (r *Resolver) exchangeTCP(m *dns.Msg) (*dns.Msg, error) {
 // FetchRaw fetches the raw bytes stored under <id>.<suffix>.<zone> without
 // interpreting them as a manifest. It is used for the git scheme, whose payload
 // is a raw object rather than a cachemoney manifest, so unlike resolveManifest
-// the bytes are returned verbatim (no JSON parse). AAAA right-pads its final
-// record with null bytes, so that padding is trimmed before returning. id is
-// the bare object id (e.g. a git SHA), not a fully-qualified name.
+// the bytes are returned verbatim (no JSON parse). The framing returns the
+// payload exactly, so content that ends in a null byte is preserved. id is the
+// bare object id (e.g. a git SHA), not a fully-qualified name.
 func (r *Resolver) FetchRaw(id string, tr objectstore.Transport) ([]byte, error) {
 	raw, err := r.fetch(dns.Fqdn(fmt.Sprintf("%s.%s.%s", id, r.suffix, r.zone)), tr)
 	if err != nil {
 		return nil, fmt.Errorf("dnszone: fetch %s: %w", id, err)
 	}
-	// AAAA right-pads its final record with null bytes; trim the padding back
-	// off so the returned length matches the object. This mirrors resolveManifest.
-	return bytes.TrimRight(raw, "\x00"), nil
+	return raw, nil
 }
 
 // fetch performs one DNS exchange and decodes the answer.

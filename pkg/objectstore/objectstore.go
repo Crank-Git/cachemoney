@@ -14,6 +14,7 @@ import (
 	"crypto/sha256"
 	"encoding/base32"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -201,22 +202,29 @@ func DecodeTXT(records []string) ([]byte, error) {
 }
 
 // EncodeAAAA encodes a frame into AAAA addresses. The top byte of each 16-byte
-// address is the sequence number; the low 15 bytes carry raw payload. Records
+// address is the sequence number; the low 15 bytes carry the payload. Records
 // may be returned in any order by a resolver; the sequence byte restores it.
+//
+// The payload is prefixed with its 4-byte big-endian length. AAAA right-pads
+// the final record with null bytes, which is ambiguous with content that
+// legitimately ends in a null byte (a binary package file, an index ending in
+// its NUL terminator). The recorded length lets the decoder recover the exact
+// payload rather than guessing where the content ends.
 func EncodeAAAA(f Frame) [][]byte {
-	out := make([][]byte, 0, (len(f.Payload)+AAAAPayloadPerRecord-1)/AAAAPayloadPerRecord)
-	for i := 0; i < len(f.Payload); i += AAAAPayloadPerRecord {
+	body := make([]byte, 4+len(f.Payload))
+	binary.BigEndian.PutUint32(body[:4], uint32(len(f.Payload)))
+	copy(body[4:], f.Payload)
+
+	out := make([][]byte, 0, (len(body)+AAAAPayloadPerRecord-1)/AAAAPayloadPerRecord)
+	for i := 0; i < len(body); i += AAAAPayloadPerRecord {
 		end := i + AAAAPayloadPerRecord
-		if end > len(f.Payload) {
-			end = len(f.Payload)
+		if end > len(body) {
+			end = len(body)
 		}
 		addr := make([]byte, 16)
 		addr[0] = byte(len(out)) // sequence number in the top byte
-		copy(addr[1:], f.Payload[i:end])
+		copy(addr[1:], body[i:end])
 		out = append(out, addr)
-	}
-	if len(f.Payload) == 0 {
-		out = [][]byte{make([]byte, 16)} // one empty record, seq 0
 	}
 	return out
 }
@@ -243,7 +251,18 @@ func DecodeAAAA(addrs [][]byte) ([]byte, error) {
 	for _, it := range items {
 		out = append(out, it.val...)
 	}
-	return out, nil
+	// Strip the 4-byte length prefix added by EncodeAAAA. AAAA right-pads the
+	// final record with null bytes, so the recorded length is what lets the
+	// decoder return the exact payload instead of trailing padding that could
+	// be mistaken for content ending in a null byte.
+	if len(out) < 4 {
+		return nil, fmt.Errorf("objectstore: aaaa payload too short for length prefix")
+	}
+	length := binary.BigEndian.Uint32(out[:4])
+	if int(length) > len(out)-4 {
+		return nil, fmt.Errorf("objectstore: aaaa payload length %d exceeds available %d", length, len(out)-4)
+	}
+	return out[4 : 4+int(length)], nil
 }
 
 // Reassemble concatenates the ordered chunks and verifies every hash against
