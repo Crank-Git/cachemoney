@@ -160,10 +160,13 @@ func TestCloneByNameAndPull(t *testing.T) {
 				t.Fatalf("no-op fetch downloaded objects:\n%s", out)
 			}
 
-			// A new branch appears and a deleted one is pruned.
+			// A new branch appears and a deleted one is pruned. The two
+			// changes are separate git commands, so a refresh can publish
+			// one without the other: wait for both.
 			git(t, src, "branch", "-D", "dev")
 			git(t, src, "branch", "feature")
 			waitForRef(t, port, tr, "refs/heads/dev", "")
+			waitForRef(t, port, tr, "refs/heads/feature", git(t, src, "rev-parse", "feature"))
 			gitIn(dest, nil, "fetch", "-q", "--prune")
 			remotes := git(t, dest, "for-each-ref", "--format=%(refname)", "refs/remotes/origin")
 			if !strings.Contains(remotes, "refs/remotes/origin/feature") || strings.Contains(remotes, "refs/remotes/origin/dev") {
