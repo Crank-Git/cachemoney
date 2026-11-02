@@ -385,3 +385,61 @@ func TestParseTreeTruncatedSHA(t *testing.T) {
 		t.Fatal("truncated SHA accepted, want error")
 	}
 }
+
+// TestWalkSkipsGitlinks walks a commit whose root tree and a subtree both hold
+// gitlink (submodule) entries. The gitlinked commits are not in this
+// repository, so fetching them must never be attempted.
+func TestWalkSkipsGitlinks(t *testing.T) {
+	objs := map[string][]byte{}
+	put := func(kind Kind, content []byte) string {
+		sha := ObjectSHA(kind, content)
+		objs[sha] = rawBytes(kind, content)
+		return sha
+	}
+	const linkRoot = "1111111111111111111111111111111111111111"
+	const linkSub = "2222222222222222222222222222222222222222"
+
+	blob := put(Blob, []byte("file\n"))
+	subEntries := []Entry{{Mode: "100644", Name: "a.txt", SHA: blob}, {Mode: GitlinkMode, Name: "vendored", SHA: linkSub}}
+	SortEntries(subEntries)
+	sub := put(Tree, MarshalTree(subEntries))
+	rootEntries := []Entry{{Mode: GitlinkMode, Name: "lib", SHA: linkRoot}, {Mode: "40000", Name: "src", SHA: sub}, {Mode: "100644", Name: "README", SHA: blob}}
+	SortEntries(rootEntries)
+	root := put(Tree, MarshalTree(rootEntries))
+	commit := put(Commit, []byte("tree "+root+"\nauthor A <a@x> 0 +0000\ncommitter A <a@x> 0 +0000\n\nmsg\n"))
+
+	var requested []string
+	got, err := Walk(func(sha string) ([]byte, error) {
+		requested = append(requested, sha)
+		if raw, ok := objs[sha]; ok {
+			return raw, nil
+		}
+		return nil, fmt.Errorf("object %s not in repository", sha)
+	}, commit)
+	if err != nil {
+		t.Fatalf("Walk: %v", err)
+	}
+	for _, sha := range requested {
+		if sha == linkRoot || sha == linkSub {
+			t.Fatalf("Walk fetched gitlinked commit %s", sha)
+		}
+	}
+	if len(got) != len(objs) {
+		t.Fatalf("Walk returned %d objects, want %d", len(got), len(objs))
+	}
+	for sha := range objs {
+		if _, ok := got[sha]; !ok {
+			t.Fatalf("Walk missed %s", sha)
+		}
+	}
+	// The gitlink entries themselves are preserved in the parsed trees.
+	links := 0
+	for _, e := range got[root].Entries {
+		if e.Mode == GitlinkMode {
+			links++
+		}
+	}
+	if links != 1 {
+		t.Fatalf("root tree has %d gitlink entries, want 1", links)
+	}
+}

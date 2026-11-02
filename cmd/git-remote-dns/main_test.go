@@ -198,3 +198,56 @@ func min(a, b int) int {
 	}
 	return b
 }
+
+// TestGitRemoteDNSCloneWithSubmodule clones, over DNS, a real repository whose
+// tree records a submodule. The superproject clone must succeed and keep the
+// gitlink entry; the submodule's own commit is not fetched.
+func TestGitRemoteDNSCloneWithSubmodule(t *testing.T) {
+	const zone = "example.com"
+	src := t.TempDir()
+	runGit(t, src, "init", "-q", "-b", "main")
+	if err := os.WriteFile(filepath.Join(src, "app.txt"), []byte("app\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, ".gitmodules"), []byte("[submodule \"lib\"]\n\tpath = lib\n\turl = https://example.com/lib.git\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, src, "add", "app.txt", ".gitmodules")
+	const link = "4444444444444444444444444444444444444444"
+	runGit(t, src, "update-index", "--add", "--cacheinfo", "160000,"+link+",lib")
+	runGit(t, src, "commit", "-q", "-m", "add submodule")
+	root := runGit(t, src, "rev-parse", "HEAD")
+
+	srv := dnszone.NewServer(dnszone.Zone(zone), dnszone.DefaultTTL)
+	if err := srv.Start("127.0.0.1:0"); err != nil {
+		t.Fatalf("start server: %v", err)
+	}
+	defer srv.Shutdown()
+	if err := gitdns.Publish(srv, root, func(sha string) ([]byte, error) {
+		return gitLooseObject(src, sha)
+	}, objectstore.TXT); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	helper := buildHelper(t)
+	dest := filepath.Join(t.TempDir(), "clone")
+	cmd := exec.Command("git", "clone", "dns://"+root, dest)
+	cmd.Env = append(os.Environ(),
+		"GIT_REMOTE_DNS_SERVER=127.0.0.1:"+strconv.Itoa(srv.Port()),
+		"GIT_REMOTE_DNS_ZONE="+zone,
+		"PATH="+filepath.Dir(helper)+":"+os.Getenv("PATH"),
+	)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git clone: %v\n%s", err, out)
+	}
+	if got := runGit(t, dest, "rev-parse", "HEAD"); got != root {
+		t.Fatalf("clone HEAD = %s, want %s", got, root)
+	}
+	if got := runGit(t, dest, "ls-tree", "HEAD", "lib"); !strings.HasPrefix(got, "160000 commit "+link) {
+		t.Fatalf("gitlink entry = %q, want 160000 commit %s", got, link)
+	}
+	if a, b := runGit(t, src, "ls-tree", "-r", "HEAD"), runGit(t, dest, "ls-tree", "-r", "HEAD"); a != b {
+		t.Fatalf("tree mismatch\n source: %s\n clone:  %s", a, b)
+	}
+	runGit(t, dest, "fsck", "--no-dangling")
+}

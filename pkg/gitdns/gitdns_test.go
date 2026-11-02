@@ -191,3 +191,48 @@ func TestFetchDetectsTampering(t *testing.T) {
 		t.Fatal("fetch succeeded despite tampered blob, want SHA mismatch")
 	}
 }
+
+// TestPublishFetchWithGitlink publishes and fetches a graph whose tree holds
+// a submodule gitlink. Both used to fail trying to fetch the submodule's
+// commit, which is not in this repository.
+func TestPublishFetchWithGitlink(t *testing.T) {
+	for _, tr := range []objectstore.Transport{objectstore.TXT, objectstore.AAAA} {
+		t.Run("transport="+strconv.Itoa(int(tr)), func(t *testing.T) {
+			objects := map[string][]byte{}
+			blob := []byte("hello")
+			blobSHA := gitobj.ObjectSHA(gitobj.Blob, blob)
+			objects[blobSHA] = rawBytes(gitobj.Blob, blob)
+			const link = "3333333333333333333333333333333333333333"
+			entries := []gitobj.Entry{{Mode: "100644", Name: "hello.txt", SHA: blobSHA}, {Mode: gitobj.GitlinkMode, Name: "sub", SHA: link}}
+			gitobj.SortEntries(entries)
+			tree := gitobj.MarshalTree(entries)
+			treeSHA := gitobj.ObjectSHA(gitobj.Tree, tree)
+			objects[treeSHA] = rawBytes(gitobj.Tree, tree)
+			commit := []byte("tree " + treeSHA + "\nauthor A <a@x> 0 +0000\ncommitter A <a@x> 0 +0000\n\nwith submodule\n")
+			commitSHA := gitobj.ObjectSHA(gitobj.Commit, commit)
+			objects[commitSHA] = rawBytes(gitobj.Commit, commit)
+
+			srv := dnszone.NewServer(dnszone.Zone("example.com"), 0)
+			if err := srv.Start("127.0.0.1:0"); err != nil {
+				t.Fatal(err)
+			}
+			defer srv.Shutdown()
+			if err := Publish(srv, commitSHA, func(sha string) ([]byte, error) {
+				if raw, ok := objects[sha]; ok {
+					return raw, nil
+				}
+				return nil, fmt.Errorf("%s not in repository", sha)
+			}, tr); err != nil {
+				t.Fatalf("Publish: %v", err)
+			}
+			r := dnszone.NewResolver("127.0.0.1:"+strconv.Itoa(srv.Port()), dnszone.Zone("example.com"), 0).WithObjectSuffix("g")
+			got, err := Fetch(r, commitSHA, tr)
+			if err != nil {
+				t.Fatalf("Fetch: %v", err)
+			}
+			if len(got) != 3 {
+				t.Fatalf("fetched %d objects, want 3", len(got))
+			}
+		})
+	}
+}
