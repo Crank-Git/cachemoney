@@ -104,7 +104,8 @@ func (s *Server) PublishRaw(fqdn string, payload []byte, tr objectstore.Transpor
 // and a chunk. The .o / .c suffixes distinguish record kinds and leave room
 // for the .g (git) and .refs schemes without re-addressing existing objects.
 // LoadStore loads objects from a local store directory into the in-memory
-// record set, framed with tr. The layout matches the CLI put command:
+// record set, framed with tr. Each manifest is served under the hash of its
+// file bytes, the address a client verifies it against. The layout matches the CLI put command:
 //
 //	<dir>/manifests/<id>.json   raw manifest bytes
 //	<dir>/chunks/<chunkid>      raw chunk bytes
@@ -130,8 +131,11 @@ func (s *Server) LoadStore(dir string, tr objectstore.Transport) error {
 		if err != nil {
 			return fmt.Errorf("dnszone: parse manifest %s: %w", e.Name(), err)
 		}
-		if err := s.store(s.manifestName(m.ID()), mb, tr); err != nil {
-			return fmt.Errorf("dnszone: store manifest %s: %w", m.ID(), err)
+		// The manifest's address is the hash of the bytes served, so derive it
+		// from the file as stored rather than from a re-marshaled copy.
+		id := objectstore.ObjectID(objectstore.ToLabel(objectstore.HashBytes(mb)))
+		if err := s.store(s.manifestName(id), mb, tr); err != nil {
+			return fmt.Errorf("dnszone: store manifest %s: %w", id, err)
 		}
 		for i, cid := range m.ChunkIDs {
 			cb, err := os.ReadFile(filepath.Join(cDir, string(cid)))
