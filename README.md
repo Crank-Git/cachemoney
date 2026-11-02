@@ -131,17 +131,9 @@ All planned work is complete:
 4. **Git over DNS** ✅ — `gitobj` model and `gitdns` publish/fetch of Git object graphs.
 5. **Package caches** ✅ — `pkgindex` model and `mirror` apt/Nix binary-cache mirror.
 
-## Future work
-
-- Parallel / concurrent fetch to keep latency down under many in-flight queries.
-- DoH/DoT transports in addition to plain DNS.
-- Resolver-side caching for hot objects.
-
 ## Open questions
 
-- Chunk size vs. UDP/EDNS limits; exact TXT vs. AAAA split.
 - Which TLD/zone hosts the records, and how contributors publish authoritatively.
-- Manifest serialization (JSON now; possibly CBOR later for size).
 
 ## License
 
