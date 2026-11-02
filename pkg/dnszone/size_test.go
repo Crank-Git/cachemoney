@@ -264,3 +264,39 @@ func TestLargeManifestIsIndirect(t *testing.T) {
 		}
 	}
 }
+
+// TestPublishRawTTL checks only the named record gets the given TTL: the
+// payload's chunks and inner manifests are content-addressed and keep the
+// server's TTL. Has reports the record.
+func TestPublishRawTTL(t *testing.T) {
+	srv, _, shutdown := newTestServer(t, objectstore.TXT)
+	defer shutdown()
+	name := dns.Fqdn("repo.refs.example.com")
+	if srv.Has(name) {
+		t.Fatal("Has before publish")
+	}
+	if err := srv.PublishRawTTL(name, randBytes(200_000), objectstore.TXT, 60); err != nil {
+		t.Fatal(err)
+	}
+	if !srv.Has(name) || !srv.Has(strings.ToUpper(name)) {
+		t.Fatal("Has after publish")
+	}
+	srv.mu.RLock()
+	defer srv.mu.RUnlock()
+	short := 0
+	for key, rrs := range srv.records {
+		ttl := rrs[0].Header().Ttl
+		switch {
+		case key == nameKey(name):
+			if ttl != 60 {
+				t.Fatalf("named record TTL %d, want 60", ttl)
+			}
+			short++
+		case ttl != DefaultTTL:
+			t.Fatalf("%s has TTL %d, want %d", key, ttl, DefaultTTL)
+		}
+	}
+	if short != 1 || len(srv.records) < 400 {
+		t.Fatalf("%d short-TTL records among %d", short, len(srv.records))
+	}
+}

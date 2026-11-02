@@ -100,7 +100,7 @@ func TestServeGitCloneEndToEnd(t *testing.T) {
 
 	for _, tr := range []string{"txt", "aaaa"} {
 		t.Run(tr, func(t *testing.T) {
-			serve := exec.Command(cm, "serve-git", "-repo", src, "-addr", "127.0.0.1:0", "-zone", "repo.example.org", "-tr", tr)
+			serve := exec.Command(cm, "serve-git", "-repo", src, "-name", "demo", "-addr", "127.0.0.1:0", "-zone", "repo.example.org", "-tr", tr)
 			stdout, err := serve.StdoutPipe()
 			if err != nil {
 				t.Fatal(err)
@@ -132,11 +132,11 @@ func TestServeGitCloneEndToEnd(t *testing.T) {
 			if len(banner) < 3 {
 				t.Fatalf("serve-git output %q, stderr %s", banner, stderr.String())
 			}
-			m := regexp.MustCompile(`at ([0-9a-f]{40}) .*\(port (\d+)\)`).FindStringSubmatch(banner[0])
+			m := regexp.MustCompile(`as demo \(\d+ refs, HEAD ([0-9a-f]{40})\) .*\(port (\d+)\)`).FindStringSubmatch(banner[0])
 			if m == nil || m[1] != head {
 				t.Fatalf("banner %q does not name HEAD %s", banner[0], head)
 			}
-			if !strings.Contains(banner[2], "git clone dns://"+head) || !strings.Contains(banner[2], "GIT_REMOTE_DNS_SERVER=127.0.0.1:"+m[2]) {
+			if !strings.Contains(banner[2], "git clone dns://demo") || !strings.Contains(banner[2], "GIT_REMOTE_DNS_SERVER=127.0.0.1:"+m[2]) {
 				t.Fatalf("clone hint %q", banner[2])
 			}
 
@@ -198,23 +198,24 @@ func TestServeGitErrors(t *testing.T) {
 	}
 	git(t, src, "add", "f")
 	git(t, src, "commit", "-q", "-m", "one")
-	blob := git(t, src, "rev-parse", "HEAD:f")
+	empty := t.TempDir()
+	git(t, empty, "init", "-q")
 
 	const ephemeral = "127.0.0.1:0"
 	cases := map[string][]string{
-		"not a repository": {"-addr", ephemeral, "-repo", t.TempDir()},
-		"unknown revision": {"-addr", ephemeral, "-repo", src, "-rev", "no-such-branch"},
-		"blob revision":    {"-addr", ephemeral, "-repo", src, "-rev", blob},
-		"option-like rev":  {"-addr", ephemeral, "-repo", src, "-rev", "--all"},
+		"not a repository": {"-addr", ephemeral, "-repo", t.TempDir(), "-name", "x"},
+		"no refs":          {"-addr", ephemeral, "-repo", empty, "-name", "x"},
+		"invalid name":     {"-addr", ephemeral, "-repo", src, "-name", "Bad_Name"},
+		"sha-like name":    {"-addr", ephemeral, "-repo", src, "-name", strings.Repeat("ab", 20)},
 		"bad transport":    {"-addr", ephemeral, "-repo", src, "-tr", "smtp"},
 		"bad address":      {"-addr", "127.0.0.1:notaport", "-repo", src},
 		"unknown flag":     {"-addr", ephemeral, "-repo", src, "-bogus"},
 	}
 	for name, args := range cases {
 		t.Run(name, func(t *testing.T) {
-			srv, _, _, err := startGitServer(args)
+			g, err := startGitServer(args)
 			if err == nil {
-				srv.Shutdown()
+				g.srv.Shutdown()
 				t.Fatal("startGitServer succeeded")
 			}
 		})
