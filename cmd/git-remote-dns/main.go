@@ -41,7 +41,7 @@ import (
 // helper is a single git-remote-dns invocation: it knows the object id to
 // serve, the resolver used to fetch it over DNS, and the transport.
 type helper struct {
-	id        string       // hex SHA-1 of the root commit to serve
+	id        string // hex SHA-1 of the root commit to serve
 	r         *dnszone.Resolver
 	transport objectstore.Transport
 	out       *bufio.Writer
@@ -49,17 +49,25 @@ type helper struct {
 
 // config holds the helper's environment-driven settings.
 type config struct {
-	server   string
-	zone     string
+	server    string
+	zone      string
 	transport string
-	timeout  string
+	timeout   string
 }
 
 func main() {
-	if err := run(os.Args); err != nil {
+	os.Exit(runMain(os.Args))
+}
+
+// runMain drives the helper and returns the process exit code: 0 on success,
+// 1 on error. Extracted from main so the error path is testable without calling
+// os.Exit, which would terminate the test process.
+func runMain(args []string) int {
+	if err := run(args); err != nil {
 		fmt.Fprintln(os.Stderr, "git-remote-dns:", err)
-		os.Exit(1)
+		return 1
 	}
+	return 0
 }
 
 // run parses the URL from git's arguments, applies the environment config, and
