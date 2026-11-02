@@ -246,36 +246,77 @@ func (s *Server) store(fqdn string, payload []byte, tr objectstore.Transport) er
 	return nil
 }
 
-// Start binds UDP and TCP on a shared ephemeral port (use "127.0.0.1:0") and
-// begins answering queries in the background. It blocks until both listeners
-// are ready, so Port() returns a usable address on return.
+// Start binds UDP and TCP on one address and begins answering queries in the
+// background. Pass port 0 (e.g. "127.0.0.1:0") for an ephemeral port shared by
+// both listeners. Both sockets are bound before Start returns, so a bind
+// failure (port in use, bad address) is returned rather than leaving Start
+// blocked, and Port() is usable on success.
 func (s *Server) Start(addr string) error {
-	// Discover a free port so UDP and TCP can share one address (the resolver
-	// uses a single server address for both transports).
-	pc, err := net.ListenPacket("udp", addr)
+	pc, ln, err := listenUDPAndTCP(addr)
 	if err != nil {
-		return fmt.Errorf("dnszone: discover port: %w", err)
+		return err
 	}
-	ua := pc.LocalAddr().(*net.UDPAddr)
-	_ = pc.Close()
-	listenAt := net.JoinHostPort(ua.IP.String(), strconv.Itoa(ua.Port))
 
 	mux := dns.NewServeMux()
 	mux.HandleFunc(".", s.handle)
 
-	var started sync.WaitGroup
-	started.Add(2)
+	started := make(chan struct{}, 2)
+	notify := func() { started <- struct{}{} }
 	// Use a larger UDP buffer (enables EDNS0) so manifests and multi-record
 	// AAAA sets fit in a single UDP answer without truncation.
-	udp := &dns.Server{Addr: listenAt, Net: "udp", Handler: mux, NotifyStartedFunc: func() { started.Done() }, UDPSize: 4096}
-	tcp := &dns.Server{Addr: listenAt, Net: "tcp", Handler: mux, NotifyStartedFunc: func() { started.Done() }, UDPSize: 4096}
-	go func() { _ = udp.ListenAndServe() }()
-	go func() { _ = tcp.ListenAndServe() }()
-	started.Wait()
+	udp := &dns.Server{PacketConn: pc, Handler: mux, NotifyStartedFunc: notify, UDPSize: 4096}
+	tcp := &dns.Server{Listener: ln, Handler: mux, NotifyStartedFunc: notify, UDPSize: 4096}
+	errc := make(chan error, 2)
+	go func() { errc <- udp.ActivateAndServe() }()
+	go func() { errc <- tcp.ActivateAndServe() }()
+	for n := 0; n < 2; n++ {
+		select {
+		case <-started:
+		case err := <-errc:
+			_ = pc.Close()
+			_ = ln.Close()
+			return fmt.Errorf("dnszone: serve %s: %w", addr, err)
+		}
+	}
 
 	s.srv = udp
 	s.srvTCP = tcp
 	return nil
+}
+
+// ephemeralBindAttempts bounds how often Start retries an ephemeral port whose
+// TCP side turns out to be taken.
+const ephemeralBindAttempts = 10
+
+// listenUDPAndTCP binds a UDP socket and a TCP listener on the same address
+// (the resolver uses one server address for both transports). For port 0 the
+// kernel picks a free UDP port, which may already be in use for TCP, so that
+// case retries with a fresh port; a fixed port is attempted once.
+func listenUDPAndTCP(addr string) (net.PacketConn, net.Listener, error) {
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, nil, fmt.Errorf("dnszone: listen %s: %w", addr, err)
+	}
+	attempts := 1
+	if port == "0" {
+		attempts = ephemeralBindAttempts
+	}
+	for i := 0; ; i++ {
+		pc, err := net.ListenPacket("udp", addr)
+		if err != nil {
+			return nil, nil, fmt.Errorf("dnszone: listen udp %s: %w", addr, err)
+		}
+		ua := pc.LocalAddr().(*net.UDPAddr)
+		tcpAddr := net.JoinHostPort(ua.IP.String(), strconv.Itoa(ua.Port))
+		ln, err := net.Listen("tcp", tcpAddr)
+		if err == nil {
+			return pc, ln, nil
+		}
+		_ = pc.Close()
+		if i+1 >= attempts {
+			return nil, nil, fmt.Errorf("dnszone: listen tcp %s: %w", tcpAddr, err)
+		}
+	}
 }
 
 // handle answers a single query from the in-memory record map. Unknown names
