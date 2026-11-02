@@ -481,12 +481,17 @@ func (r *Resolver) fetchOnce(name string, tr objectstore.Transport) ([]byte, uin
 		qtype = dns.TypeAAAA
 	}
 	m := new(dns.Msg)
+	// SetQuestion leaves RD set. An authoritative server ignores it, and a
+	// recursive resolver (the cache this design relies on) only resolves on
+	// a client's behalf when it is set.
 	m.SetQuestion(name, qtype)
-	m.RecursionDesired = false
 
 	resp, err := r.exchange(m)
 	if err != nil {
 		return nil, 0, err
+	}
+	if resp.Rcode == dns.RcodeNameError {
+		return nil, 0, errNotFound
 	}
 	if resp.Rcode != dns.RcodeSuccess {
 		return nil, 0, fmt.Errorf("dns: rcode %s for %s", dns.RcodeToString[resp.Rcode], name)
