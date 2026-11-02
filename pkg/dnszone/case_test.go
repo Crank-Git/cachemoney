@@ -203,10 +203,10 @@ func TestFetchByIDAcceptsLowercaseID(t *testing.T) {
 // replaced and removed by the same name in another.
 func TestStoreAndForgetAreCaseInsensitive(t *testing.T) {
 	srv := NewServer(Zone("example.com"), 0)
-	if err := srv.PublishRaw("ABC.g.Example.COM.", []byte("one"), objectstore.TXT); err != nil {
+	if err := srv.store("ABC.g.Example.COM.", []byte("one"), objectstore.TXT); err != nil {
 		t.Fatal(err)
 	}
-	if err := srv.PublishRaw("abc.g.example.com.", []byte("two"), objectstore.TXT); err != nil {
+	if err := srv.store("abc.g.example.com.", []byte("two"), objectstore.TXT); err != nil {
 		t.Fatal(err)
 	}
 	if n := len(srv.records); n != 1 {

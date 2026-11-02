@@ -322,3 +322,32 @@ func TestFetchWithAnyResolverSuffix(t *testing.T) {
 		})
 	}
 }
+
+// TestRoundTripLargeFile publishes and fetches a 300 KB package file. Files
+// used to be one record each, so anything past ~47 KB (TXT) or ~3.8 KB (AAAA)
+// could not be served.
+func TestRoundTripLargeFile(t *testing.T) {
+	for _, tr := range []objectstore.Transport{objectstore.TXT, objectstore.AAAA} {
+		t.Run("transport="+strconv.Itoa(int(tr)), func(t *testing.T) {
+			data := make([]byte, 300_000)
+			for i := range data {
+				data[i] = byte(i % 253)
+			}
+			sum := sha256.Sum256(data)
+			idx := pkgindex.NewIndex([]pkgindex.Entry{{Path: "/pool/big.deb", Mode: "100644", Size: len(data), SHA256: hex.EncodeToString(sum[:])}})
+			srv, rr, shutdown := startServer(t)
+			defer shutdown()
+			label, err := Publish(srv, idx, map[string][]byte{"/pool/big.deb": data}, tr)
+			if err != nil {
+				t.Fatalf("publish: %v", err)
+			}
+			got, err := Fetch(rr, label, "/pool/big.deb", tr)
+			if err != nil {
+				t.Fatalf("fetch: %v", err)
+			}
+			if !bytes.Equal(got, data) {
+				t.Fatal("round-trip mismatch")
+			}
+		})
+	}
+}

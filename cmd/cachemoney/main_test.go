@@ -281,3 +281,43 @@ func buildBinary(t *testing.T) string {
 	}
 	return bin
 }
+
+// TestServeFetchLargeObject runs put -> serve -> fetch for a 2 MB file. Its
+// manifest is far larger than one record, so serve must store it indirectly
+// and fetch must follow the chain.
+func TestServeFetchLargeObject(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		transport objectstore.Transport
+	}{{"txt", objectstore.TXT}, {"aaaa", objectstore.AAAA}} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			store := filepath.Join(dir, "store")
+			in := filepath.Join(dir, "input.bin")
+			out := filepath.Join(dir, "output.bin")
+			payload := make([]byte, 2<<20)
+			for i := range payload {
+				payload[i] = byte(i*13 + i/1021)
+			}
+			if err := os.WriteFile(in, payload, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := run([]string{"put", "-store", store, in}); err != nil {
+				t.Fatalf("put: %v", err)
+			}
+			id := findObjectID(t, store)
+			srv := startServingServer(t, store, tc.transport)
+			addr := "127.0.0.1:" + strconv.Itoa(srv.Port())
+			if err := run([]string{"fetch", "-addr", addr, "-tr", tc.name, "-out", out, string(id)}); err != nil {
+				t.Fatalf("fetch: %v", err)
+			}
+			got, err := os.ReadFile(out)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, payload) {
+				t.Fatalf("round-trip mismatch: got %d bytes, want %d", len(got), len(payload))
+			}
+		})
+	}
+}
