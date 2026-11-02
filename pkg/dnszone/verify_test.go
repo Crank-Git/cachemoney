@@ -9,8 +9,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/miekg/dns"
-
 	"github.com/Crank-Git/cachemoney/pkg/objectstore"
 )
 
@@ -139,7 +137,7 @@ func TestLoadStoreServesManifestUnderFileHash(t *testing.T) {
 		t.Fatal("round-trip mismatch")
 	}
 	srv.mu.RLock()
-	_, servedUnderReMarshal := srv.records[dns.Fqdn(srv.manifestName(m.ID()))]
+	_, servedUnderReMarshal := srv.records[nameKey(srv.manifestName(m.ID()))]
 	srv.mu.RUnlock()
 	if servedUnderReMarshal && fileID != m.ID() {
 		t.Fatal("manifest served under a re-marshaled id that does not hash its bytes")

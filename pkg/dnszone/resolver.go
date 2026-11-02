@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -240,6 +241,9 @@ func (r *Resolver) Fetch(m *objectstore.Manifest, tr objectstore.Transport) ([]b
 // and returns the reassembled, verified object. It is the entry point when you
 // have an object id but not its manifest bytes (as the CLI fetch command does).
 func (r *Resolver) FetchByID(id objectstore.ObjectID, tr objectstore.Transport) ([]byte, error) {
+	// Object ids are base32, whose alphabet is case-insensitive; accept an id
+	// typed or copied in either case.
+	id = objectstore.ObjectID(strings.ToUpper(string(id)))
 	if r.cache != nil {
 		if _, obj, ok := r.cache.Get(id); ok {
 			return obj, nil

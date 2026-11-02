@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/miekg/dns"
@@ -268,5 +269,26 @@ func TestFetchMissingFile(t *testing.T) {
 
 	if _, err := Fetch(rr, idx.Label(), "/zeta", objectstore.TXT); err == nil {
 		t.Fatal("fetch succeeded for unpublished file, want error")
+	}
+}
+
+// TestFetchAcceptsLowercaseIndexLabel checks an index label copied in
+// lowercase still verifies against the fetched index.
+func TestFetchAcceptsLowercaseIndexLabel(t *testing.T) {
+	idx, files := testIndex()
+	srv, rr, shutdown := startServer(t)
+	defer shutdown()
+	label, err := Publish(srv, idx, files, objectstore.TXT)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for path, want := range files {
+		got, err := Fetch(rr, strings.ToLower(label), path, objectstore.TXT)
+		if err != nil {
+			t.Fatalf("fetch %s with lowercase label: %v", path, err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("fetch %s: got %q, want %q", path, got, want)
+		}
 	}
 }
