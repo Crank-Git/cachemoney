@@ -277,18 +277,7 @@ func (s *Server) Start(addr string) error {
 // handle answers a single query from the in-memory record map. Unknown names
 // yield NODATA (an empty answer), which a client treats as not-found.
 func (s *Server) handle(w dns.ResponseWriter, req *dns.Msg) {
-	m := new(dns.Msg)
-	m.SetReply(req)
-	m.Authoritative = true
-	// Hold the read lock while copying the answer so a concurrent Publish
-	// cannot mutate the slice we are appending to.
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	for _, q := range req.Question {
-		if recs, ok := s.records[q.Name]; ok {
-			m.Answer = append(m.Answer, recs...)
-		}
-	}
+	m := s.answer(req)
 	// Truncate UDP answers to fit within the client's advertised UDP buffer so a
 	// response too large for a single UDP datagram is split with the TC bit set;
 	// the resolver uses TC to fall back to TCP (RFC 1035). Without truncation the
@@ -301,6 +290,27 @@ func (s *Server) handle(w dns.ResponseWriter, req *dns.Msg) {
 		}
 	}
 	_ = w.WriteMsg(m)
+}
+
+// answer builds the response for req from the in-memory record map: each
+// question is matched against the stored records and any match is placed in the
+// answer section (NODATA when a name has no records). It holds the read lock and
+// never truncates or writes -- callers choose the framing (UDP truncation, TCP
+// length prefix, or a DoH body).
+func (s *Server) answer(req *dns.Msg) *dns.Msg {
+	m := new(dns.Msg)
+	m.SetReply(req)
+	m.Authoritative = true
+	// Hold the read lock while copying the answer so a concurrent Publish
+	// cannot mutate the slice we are appending to.
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, q := range req.Question {
+		if recs, ok := s.records[q.Name]; ok {
+			m.Answer = append(m.Answer, recs...)
+		}
+	}
+	return m
 }
 
 // Shutdown stops the server and releases its ports.

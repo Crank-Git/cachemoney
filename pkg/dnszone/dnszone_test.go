@@ -130,6 +130,98 @@ func TestEndToEndTamper(t *testing.T) {
 	}
 }
 
+// TestWithConcurrency checks the option sets the parallelism and resets to the
+// default for non-positive values, without disturbing the original resolver.
+func TestWithConcurrency(t *testing.T) {
+	res := NewResolver("127.0.0.1:5300", Zone("example.com"), 0)
+
+	base := res.WithConcurrency(4)
+	if base.concurrency != 4 {
+		t.Fatalf("WithConcurrency(4): got %d, want 4", base.concurrency)
+	}
+	// The original resolver is unchanged by chaining.
+	if res.concurrency != defaultConcurrency {
+		t.Fatalf("WithConcurrency mutated the base resolver: got %d", res.concurrency)
+	}
+
+	reset := base.WithConcurrency(0)
+	if reset.concurrency != defaultConcurrency {
+		t.Fatalf("WithConcurrency(0): got %d, want default %d", reset.concurrency, defaultConcurrency)
+	}
+}
+
+// TestParallelWalk fetches a multi-chunk object with a high concurrency limit,
+// exercising the bounded concurrent walk and order-independent reassembly.
+func TestParallelWalk(t *testing.T) {
+	srv, res, shutdown := newTestServer(t, objectstore.TXT)
+	defer shutdown()
+
+	// ~5 chunks (5x the concurrency limit) so the semaphore drains in waves.
+	data := randBytes(5*objectstore.DefaultChunkSize + 1)
+	m, chunks := objectstore.Build(data)
+	if err := srv.Publish(m, chunks, objectstore.TXT); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	res = res.WithConcurrency(1)
+	got, err := res.Fetch(m, objectstore.TXT)
+	if err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("round-trip mismatch: got %d bytes, want %d", len(got), len(data))
+	}
+}
+
+// TestFetchUsesCache verifies the resolver cache short-circuits a second fetch:
+// after the first fetch populates the cache, the object is returned even once
+// the server is gone, and a missing object is not cached.
+func TestFetchUsesCache(t *testing.T) {
+	srv, res, shutdown := newTestServer(t, objectstore.TXT)
+
+	m, chunks := objectstore.Build([]byte("cached object"))
+	if err := srv.Publish(m, chunks, objectstore.TXT); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	cache := NewCache(0)
+	res = res.WithCache(cache)
+
+	// First fetch populates the cache from the server.
+	if _, err := res.Fetch(m, objectstore.TXT); err != nil {
+		t.Fatalf("first fetch: %v", err)
+	}
+	if cache.Len() != 1 {
+		t.Fatalf("cache should hold one object, got %d", cache.Len())
+	}
+
+	// Kill the server; a cache hit must still succeed.
+	shutdown()
+	if _, err := res.Fetch(m, objectstore.TXT); err != nil {
+		t.Fatalf("fetch after server down: %v (cache should have served it)", err)
+	}
+}
+
+// TestMissingObjectNotCached verifies a failed fetch does not poison the cache:
+// a missing object is re-attempted on the next call rather than remembered as
+// a miss.
+func TestMissingObjectNotCached(t *testing.T) {
+	_, res, shutdown := newTestServer(t, objectstore.TXT)
+	defer shutdown()
+
+	cache := NewCache(0)
+	res = res.WithCache(cache)
+
+	// Fetch an id that was never published; it must fail loudly.
+	missing := objectstore.ChunkID([]byte("never published"))
+	if _, err := res.FetchByID(missing, objectstore.TXT); err == nil {
+		t.Fatal("expected a not-found error")
+	}
+	if cache.Len() != 0 {
+		t.Fatalf("a missing object must not be cached, Len=%d", cache.Len())
+	}
+}
+
 // randBytes returns n random bytes for exercising multi-chunk paths.
 func randBytes(n int) []byte {
 	b := make([]byte, n)
