@@ -27,9 +27,19 @@ import (
 // Zone is the apex DNS name served by a Server, e.g. "example.com".
 type Zone string
 
-// DefaultTTL is how long records may be cached, in seconds. Immutable objects
-// can live a long time; refs are expected to be short-lived in production.
-const DefaultTTL uint32 = 300
+// DefaultTTL is how long records may be cached, in seconds: one day. Every
+// record the server holds is content-addressed and never changes, so caches
+// may keep it as long as they are willing to.
+const DefaultTTL uint32 = 86400
+
+// NegativeTTL is how long a resolver may cache a negative answer (NXDOMAIN or
+// NODATA), carried as the SOA minimum (RFC 2308). It is short because an
+// object that is missing now may be published a moment later.
+const NegativeTTL uint32 = 60
+
+// serverUDPSize is the EDNS0 UDP payload size the server advertises in its
+// responses.
+const serverUDPSize = 1232
 
 // Server is a minimal authoritative DNS server for one zone. It holds records
 // in memory, keyed by lowercased fully-qualified name (DNS names are
@@ -38,10 +48,16 @@ const DefaultTTL uint32 = 300
 type Server struct {
 	zone    Zone
 	ttl     uint32
+	ns      string
 	mu      sync.RWMutex
 	records map[string][]dns.RR
-	srv     *dns.Server
-	srvTCP  *dns.Server
+	// ents counts, for each name between a record and the apex, how many
+	// records sit below it. Such empty non-terminals (e.g. c.<zone>) must
+	// answer NODATA, not NXDOMAIN: a resolver may take NXDOMAIN to mean
+	// nothing below the name exists (RFC 8020).
+	ents   map[string]int
+	srv    *dns.Server
+	srvTCP *dns.Server
 }
 
 // NewServer creates a server for zone. ttl overrides the default if > 0.
@@ -52,7 +68,54 @@ func NewServer(zone Zone, ttl uint32) *Server {
 	return &Server{
 		zone:    zone,
 		ttl:     ttl,
+		ns:      dns.Fqdn("ns." + string(zone)),
 		records: make(map[string][]dns.RR),
+		ents:    make(map[string]int),
+	}
+}
+
+// SetNameserver sets the host name the server reports in its NS and SOA
+// records at the zone apex (default "ns.<zone>"). It should be the name the
+// parent zone delegates to.
+func (s *Server) SetNameserver(host string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ns = dns.Fqdn(host)
+}
+
+// apex is the zone's lowercased fully-qualified name.
+func (s *Server) apex() string { return nameKey(dns.Fqdn(string(s.zone))) }
+
+// setRecords stores rrs under key, tracking the empty non-terminals above a
+// new name. Callers hold the write lock.
+func (s *Server) setRecords(key string, rrs []dns.RR) {
+	if _, exists := s.records[key]; !exists {
+		s.walkENTs(key, 1)
+	}
+	s.records[key] = rrs
+}
+
+// deleteRecords removes key and releases its empty non-terminals. Callers
+// hold the write lock.
+func (s *Server) deleteRecords(key string) {
+	if _, exists := s.records[key]; !exists {
+		return
+	}
+	delete(s.records, key)
+	s.walkENTs(key, -1)
+}
+
+// walkENTs adds delta to every name strictly between key and the apex.
+func (s *Server) walkENTs(key string, delta int) {
+	apex := s.apex()
+	for off, end := dns.NextLabel(key, 0); !end; off, end = dns.NextLabel(key, off) {
+		parent := key[off:]
+		if parent == apex || !dns.IsSubDomain(apex, parent) {
+			return
+		}
+		if s.ents[parent] += delta; s.ents[parent] <= 0 {
+			delete(s.ents, parent)
+		}
 	}
 }
 
@@ -203,7 +266,7 @@ func (s *Server) Corrupt(id objectstore.ObjectID) error {
 func (s *Server) Forget(fqdn string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.records, nameKey(fqdn))
+	s.deleteRecords(nameKey(fqdn))
 }
 
 // CorruptAt flips a byte in the first TXT piece of the record stored under the
@@ -255,10 +318,10 @@ func (s *Server) store(fqdn string, payload []byte, tr objectstore.Transport) er
 	switch tr {
 	case objectstore.TXT:
 		pieces := objectstore.EncodeTXT(objectstore.Frame{Payload: payload})
-		s.records[nameKey(fqdn)] = []dns.RR{&dns.TXT{
+		s.setRecords(nameKey(fqdn), []dns.RR{&dns.TXT{
 			Hdr: dns.RR_Header{Name: fqdn, Rrtype: dns.TypeTXT, Class: dns.ClassINET, Ttl: s.ttl},
 			Txt: pieces,
-		}}
+		}})
 	case objectstore.AAAA:
 		addrs := objectstore.EncodeAAAA(objectstore.Frame{Payload: payload})
 		rrs := make([]dns.RR, 0, len(addrs))
@@ -268,7 +331,7 @@ func (s *Server) store(fqdn string, payload []byte, tr objectstore.Transport) er
 				AAAA: net.IP(a),
 			})
 		}
-		s.records[nameKey(fqdn)] = rrs
+		s.setRecords(nameKey(fqdn), rrs)
 	default:
 		return fmt.Errorf("objectstore: unknown transport %d", tr)
 	}
@@ -348,59 +411,121 @@ func listenUDPAndTCP(addr string) (net.PacketConn, net.Listener, error) {
 	}
 }
 
-// handle answers a single query from the in-memory record map. Unknown names
-// yield NODATA (an empty answer), which a client treats as not-found.
+// handle answers a single query. UDP answers are truncated (TC bit set) to
+// fit the client's advertised EDNS0 buffer, or 512 bytes for a client without
+// EDNS0, so an oversized datagram is never fragmented and dropped on the wire;
+// the client retries over TCP (RFC 1035). TCP answers are length-prefixed and
+// never truncated, so detect the network via the peer address.
 func (s *Server) handle(w dns.ResponseWriter, req *dns.Msg) {
 	m := s.answer(req)
-	// Truncate UDP answers to fit within the client's advertised UDP buffer so a
-	// response too large for a single UDP datagram is split with the TC bit set;
-	// the resolver uses TC to fall back to TCP (RFC 1035). Without truncation the
-	// oversized datagram is fragmented and dropped on the wire. TCP answers are
-	// length-prefixed and must never be truncated, so detect the network via the
-	// peer address (UDP -> *net.UDPAddr, TCP -> *net.TCPAddr).
 	if _, isTCP := w.RemoteAddr().(*net.TCPAddr); !isTCP {
-		if opt := req.IsEdns0(); opt != nil {
-			m.Truncate(int(opt.UDPSize()))
-			// Truncate turns compression off when the uncompressed answer
-			// fits; keep it on so a large buffer never costs extra bytes.
-			m.Compress = true
+		size := dns.MinMsgSize
+		if opt := req.IsEdns0(); opt != nil && int(opt.UDPSize()) > size {
+			size = int(opt.UDPSize())
 		}
+		m.Truncate(size)
+		// Truncate turns compression off when the uncompressed answer fits;
+		// keep it on so a large buffer never costs extra bytes.
+		m.Compress = true
 	}
 	_ = w.WriteMsg(m)
 }
 
-// answer builds the response for req from the in-memory record map: each
-// question is matched against the stored records and any match is placed in the
-// answer section (NODATA when a name has no records). It holds the read lock and
-// never truncates or writes -- callers choose the framing (UDP truncation, TCP
-// length prefix, or a DoH body).
+// answer builds the authoritative response for req. It holds the read lock
+// and never truncates or writes; callers choose the framing (UDP truncation,
+// TCP length prefix, or a DoH body).
+//
+//   - Opcodes other than QUERY get NOTIMP; anything but one question FORMERR.
+//   - Names outside the zone get REFUSED (not authoritative).
+//   - The apex answers SOA and NS.
+//   - A stored name answers its records when the type matches, else NODATA.
+//   - An empty non-terminal (a name above stored records) answers NODATA.
+//   - Any other name in the zone answers NXDOMAIN.
+//
+// Negative answers carry the SOA in the authority section so resolvers can
+// cache them for NegativeTTL (RFC 2308). EDNS0 is echoed when the query used
+// it (RFC 6891), with BADVERS for an unsupported version.
 func (s *Server) answer(req *dns.Msg) *dns.Msg {
 	m := new(dns.Msg)
 	m.SetReply(req)
-	m.Authoritative = true
 	// Compress owner names: every record in an answer shares the question's
 	// name, so without compression each AAAA record repeats the full ~70-byte
 	// name and a 1 KB chunk grows from ~2 KB to ~6.5 KB on the wire.
 	m.Compress = true
+
+	opt := req.IsEdns0()
+	if opt != nil {
+		defer m.SetEdns0(serverUDPSize, false)
+		if opt.Version() != 0 {
+			m.Rcode = dns.RcodeBadVers
+			return m
+		}
+	}
+	if req.Opcode != dns.OpcodeQuery {
+		m.Rcode = dns.RcodeNotImplemented
+		return m
+	}
+	if len(req.Question) != 1 {
+		m.Rcode = dns.RcodeFormatError
+		return m
+	}
+	q := req.Question[0]
+	key, apex := nameKey(q.Name), s.apex()
+	if !dns.IsSubDomain(apex, key) {
+		m.Rcode = dns.RcodeRefused
+		return m
+	}
+	m.Authoritative = true
+
 	// Hold the read lock while copying the answer so a concurrent Publish
 	// cannot mutate the slice we are appending to.
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	for _, q := range req.Question {
-		recs, ok := s.records[nameKey(q.Name)]
-		if !ok {
-			continue
+	// Answer with the owner name spelled exactly as asked. Resolvers that
+	// randomize query case (DNS 0x20) match the response against the case
+	// they sent, so the stored spelling must not leak through.
+	add := func(rr dns.RR) {
+		c := dns.Copy(rr)
+		c.Header().Name = q.Name
+		m.Answer = append(m.Answer, c)
+	}
+	if key == apex {
+		if q.Qtype == dns.TypeSOA || q.Qtype == dns.TypeANY {
+			add(s.soa())
 		}
-		// Answer with the owner name spelled exactly as asked. Resolvers
-		// that randomize query case (DNS 0x20) match the response against
-		// the case they sent, so the stored spelling must not leak through.
+		if q.Qtype == dns.TypeNS || q.Qtype == dns.TypeANY {
+			add(&dns.NS{Hdr: dns.RR_Header{Name: apex, Rrtype: dns.TypeNS, Class: dns.ClassINET, Ttl: s.ttl}, Ns: s.ns})
+		}
+	} else if recs, ok := s.records[key]; ok {
 		for _, rr := range recs {
-			c := dns.Copy(rr)
-			c.Header().Name = q.Name
-			m.Answer = append(m.Answer, c)
+			if q.Qtype == dns.TypeANY || rr.Header().Rrtype == q.Qtype {
+				add(rr)
+			}
 		}
+	} else if s.ents[key] == 0 {
+		m.Rcode = dns.RcodeNameError
+	}
+	if len(m.Answer) == 0 {
+		m.Ns = append(m.Ns, s.soa())
 	}
 	return m
+}
+
+// soa is the zone's start-of-authority record. Its minimum field is the
+// negative-caching TTL, and the record itself carries the same TTL as it
+// rides in negative answers. Callers hold the read lock.
+func (s *Server) soa() *dns.SOA {
+	apex := dns.Fqdn(string(s.zone))
+	return &dns.SOA{
+		Hdr:     dns.RR_Header{Name: apex, Rrtype: dns.TypeSOA, Class: dns.ClassINET, Ttl: NegativeTTL},
+		Ns:      s.ns,
+		Mbox:    "hostmaster." + apex,
+		Serial:  1,
+		Refresh: 3600,
+		Retry:   600,
+		Expire:  604800,
+		Minttl:  NegativeTTL,
+	}
 }
 
 // nameKey is the record-map key for a name: DNS names compare

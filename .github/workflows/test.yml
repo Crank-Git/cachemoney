@@ -23,7 +23,20 @@ jobs:
       - name: Format (gofmt)
         run: test -z "$(gofmt -l $(find . -name '*.go' -not -path './vendor/*'))" && echo "gofmt clean"
 
+      - name: Install unbound (recursive resolver integration test)
+        run: |
+          # Keep apt from starting the system unbound service (it would fight
+          # systemd-resolved for port 53); the test runs its own instance.
+          printf '#!/bin/sh\nexit 101\n' | sudo tee /usr/sbin/policy-rc.d >/dev/null
+          sudo chmod +x /usr/sbin/policy-rc.d
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends unbound
+          # The packaged AppArmor profile only allows configs under /etc.
+          sudo apparmor_parser -R /etc/apparmor.d/usr.sbin.unbound 2>/dev/null || true
+
       - name: Test
+        env:
+          CACHEMONEY_REQUIRE_UNBOUND: "1"
         run: go test -race -coverprofile=coverage.out ./...
 
       - name: Vet

@@ -145,9 +145,13 @@ func serve(args []string) error {
 	zone := fs.String("zone", "example.com", "zone apex to serve")
 	addr := fs.String("addr", "127.0.0.1:5300", "listen address (host:port)")
 	tr := fs.String("tr", "txt", "transport: txt or aaaa")
+	ns := fs.String("ns", "", "nameserver host for the zone's NS and SOA records (default ns.<zone>)")
 	fs.Parse(args)
 
 	srv := dnszone.NewServer(dnszone.Zone(*zone), 0)
+	if *ns != "" {
+		srv.SetNameserver(*ns)
+	}
 	trv, err := parseTransport(*tr)
 	if err != nil {
 		return err
