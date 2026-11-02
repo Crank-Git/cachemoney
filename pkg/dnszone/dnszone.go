@@ -346,6 +346,10 @@ func (s *Server) answer(req *dns.Msg) *dns.Msg {
 	m := new(dns.Msg)
 	m.SetReply(req)
 	m.Authoritative = true
+	// Compress owner names: every record in an answer shares the question's
+	// name, so without compression each AAAA record repeats the full ~70-byte
+	// name and a 1 KB chunk grows from ~2 KB to ~6.5 KB on the wire.
+	m.Compress = true
 	// Hold the read lock while copying the answer so a concurrent Publish
 	// cannot mutate the slice we are appending to.
 	s.mu.RLock()
