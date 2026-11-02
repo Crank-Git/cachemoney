@@ -130,6 +130,10 @@ func (r *Resolver) WithConcurrency(n int) *Resolver {
 	return &c
 }
 
+// Concurrency reports how many fetches the resolver runs in parallel while
+// walking an object graph.
+func (r *Resolver) Concurrency() int { return r.concurrency }
+
 // WithCache returns the resolver with an object cache enabled. Cache lookups
 // short-circuit a fetch: a reassembled, verified object is returned directly
 // when its id is present and unexpired. Objects are cached for the lifetime of

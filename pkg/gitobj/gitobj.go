@@ -230,55 +230,91 @@ func ReadObject(raw []byte) (*Object, error) {
 
 // Walk fetches the commit at commitSHA and every object it references,
 // verifying each object's SHA-1 as it is fetched. Gitlink (submodule) entries
-// are not followed: their commits live in another repository. fetch retrieves the raw
-// (uncompressed) bytes of a Git object by its hex SHA-1. It returns every
-// object encountered, keyed by SHA.
+// are not followed: their commits live in another repository. fetch retrieves
+// the raw (uncompressed) bytes of a Git object by its hex SHA-1 and is called
+// one object at a time. It returns every object encountered, keyed by SHA.
 func Walk(fetch func(sha string) ([]byte, error), commitSHA string) (map[string]*Object, error) {
-	objects := make(map[string]*Object)
-	var stack []string
-	stack = append(stack, commitSHA)
-	for len(stack) > 0 {
-		sha := stack[len(stack)-1]
-		stack = stack[:len(stack)-1]
-		if _, seen := objects[sha]; seen {
-			continue
-		}
+	return WalkConcurrent(fetch, commitSHA, 1)
+}
+
+// WalkConcurrent is Walk with up to workers fetches in flight at once, for a
+// fetch whose latency dominates (one network round trip per object). fetch
+// must be safe for concurrent use when workers > 1. On the first error no new
+// fetches start, in-flight ones are drained, and that error is returned.
+func WalkConcurrent(fetch func(sha string) ([]byte, error), commitSHA string, workers int) (map[string]*Object, error) {
+	if workers < 1 {
+		workers = 1
+	}
+	type result struct {
+		sha string
+		obj *Object
+		err error
+	}
+	results := make(chan result)
+	load := func(sha string) {
 		raw, err := fetch(sha)
 		if err != nil {
-			return nil, fmt.Errorf("gitobj: fetch %s: %w", sha, err)
+			results <- result{sha: sha, err: fmt.Errorf("gitobj: fetch %s: %w", sha, err)}
+			return
 		}
 		o, err := ReadObject(raw)
-		if err != nil {
-			return nil, err
+		if err == nil && o.SHA != sha {
+			err = fmt.Errorf("gitobj: %s resolved to object %s", sha, o.SHA)
 		}
-		if o.SHA != sha {
-			return nil, fmt.Errorf("gitobj: %s resolved to object %s", sha, o.SHA)
+		results <- result{sha: sha, obj: o, err: err}
+	}
+
+	objects := make(map[string]*Object)
+	queued := map[string]bool{commitSHA: true}
+	pending := []string{commitSHA}
+	enqueue := func(sha string) {
+		if !queued[sha] {
+			queued[sha] = true
+			pending = append(pending, sha)
 		}
-		objects[sha] = o
+	}
+	inflight := 0
+	var firstErr error
+	for {
+		for firstErr == nil && inflight < workers && len(pending) > 0 {
+			sha := pending[len(pending)-1]
+			pending = pending[:len(pending)-1]
+			inflight++
+			go load(sha)
+		}
+		if inflight == 0 {
+			break
+		}
+		res := <-results
+		inflight--
+		if res.err != nil {
+			if firstErr == nil {
+				firstErr = res.err
+			}
+			continue
+		}
+		o := res.obj
+		objects[res.sha] = o
 		switch o.Kind {
 		case Tree:
 			for _, e := range o.Entries {
 				// A gitlink names a commit in another repository (a
 				// submodule); it is not part of this graph.
-				if e.Mode == GitlinkMode {
-					continue
-				}
-				if _, seen := objects[e.SHA]; !seen {
-					stack = append(stack, e.SHA)
+				if e.Mode != GitlinkMode {
+					enqueue(e.SHA)
 				}
 			}
 		case Commit:
 			if o.Tree != "" {
-				if _, seen := objects[o.Tree]; !seen {
-					stack = append(stack, o.Tree)
-				}
+				enqueue(o.Tree)
 			}
 			for _, p := range o.Parents {
-				if _, seen := objects[p]; !seen {
-					stack = append(stack, p)
-				}
+				enqueue(p)
 			}
 		}
+	}
+	if firstErr != nil {
+		return nil, firstErr
 	}
 	return objects, nil
 }

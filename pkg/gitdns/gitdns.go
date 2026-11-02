@@ -43,14 +43,12 @@ func Publish(s *dnszone.Server, commitSHA string, fetch func(sha string) ([]byte
 
 // Fetch walks the object graph rooted at commitSHA over DNS, fetching each
 // object's raw bytes from the server and verifying its SHA-1 as it is
-// retrieved. It returns every object encountered, keyed by SHA. The resolver
+// retrieved. Up to the resolver's concurrency (dnszone.Resolver.WithConcurrency)
+// objects are fetched at once, so a large history is not one round trip after
+// another. It returns every object encountered, keyed by SHA. The resolver
 // must be configured for the git scheme (see dnszone.Resolver.WithObjectSuffix).
 func Fetch(r *dnszone.Resolver, commitSHA string, tr objectstore.Transport) (map[string]*gitobj.Object, error) {
-	return gitobj.Walk(func(sha string) ([]byte, error) {
-		raw, err := r.FetchRaw(sha, tr)
-		if err != nil {
-			return nil, err
-		}
-		return raw, nil
-	}, commitSHA)
+	return gitobj.WalkConcurrent(func(sha string) ([]byte, error) {
+		return r.FetchRaw(sha, tr)
+	}, commitSHA, r.Concurrency())
 }
