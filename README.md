@@ -78,6 +78,7 @@ Configuration comes from the environment git passes to helpers:
 | `GIT_REMOTE_DNS_SERVER` | no | `127.0.0.1:5300` | Resolver host:port |
 | `GIT_REMOTE_DNS_TRANSPORT` | no | `txt` | `txt` or `aaaa` |
 | `GIT_REMOTE_DNS_TIMEOUT` | no | `5s` | Resolver timeout |
+| `GIT_REMOTE_DNS_TRACE` | no | unset | Log the helper protocol to stderr |
 
 ## Repository layout
 

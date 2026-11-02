@@ -17,6 +17,7 @@
 //	GIT_REMOTE_DNS_ZONE     zone apex to query (required)
 //	GIT_REMOTE_DNS_TRANSPORT transport: "txt" (default) or "aaaa"
 //	GIT_REMOTE_DNS_TIMEOUT  per-query timeout, default 5s
+//	GIT_REMOTE_DNS_TRACE    when set, log the protocol stream to stderr
 package main
 
 import (
@@ -90,8 +91,13 @@ func run(args []string) error {
 	return h.run()
 }
 
-// trace writes a line to stderr for debugging the protocol stream.
+// trace writes a line to stderr for debugging the protocol stream. It is
+// silent unless GIT_REMOTE_DNS_TRACE is set, so a normal clone prints nothing
+// from the helper.
 func trace(args ...any) {
+	if os.Getenv("GIT_REMOTE_DNS_TRACE") == "" {
+		return
+	}
 	fmt.Fprintln(os.Stderr, args...)
 }
 
@@ -354,7 +360,9 @@ func (h *helper) buildPack(objects map[string]*gitobj.Object) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	// defer os.RemoveAll(tmp)  // TEMP disabled for inspection
+	// The temporary repository only exists to run pack-objects; the pack is
+	// returned in memory, so remove it on every path.
+	defer os.RemoveAll(tmp)
 
 	// git pack-objects requires a real git repository (a .git dir with a HEAD
 	// file), not just an objects/ directory. Initialize one here.

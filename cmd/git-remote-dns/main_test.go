@@ -14,6 +14,7 @@ import (
 
 	"github.com/Crank-Git/cachemoney/pkg/dnszone"
 	"github.com/Crank-Git/cachemoney/pkg/gitdns"
+	"github.com/Crank-Git/cachemoney/pkg/gitobj"
 	"github.com/Crank-Git/cachemoney/pkg/objectstore"
 )
 
@@ -250,4 +251,97 @@ func TestGitRemoteDNSCloneWithSubmodule(t *testing.T) {
 		t.Fatalf("tree mismatch\n source: %s\n clone:  %s", a, b)
 	}
 	runGit(t, dest, "fsck", "--no-dangling")
+}
+
+// cloneOverDNS publishes writeRepo's repository and clones it with the built
+// helper, using tmp as the helper's TMPDIR and any extra environment. It
+// returns the clone's combined output.
+func cloneOverDNS(t *testing.T, tmp string, extraEnv ...string) string {
+	t.Helper()
+	const zone = "example.com"
+	src := t.TempDir()
+	root := writeRepo(t, src)
+	srv := dnszone.NewServer(dnszone.Zone(zone), dnszone.DefaultTTL)
+	if err := srv.Start("127.0.0.1:0"); err != nil {
+		t.Fatalf("start server: %v", err)
+	}
+	defer srv.Shutdown()
+	if err := gitdns.Publish(srv, root, func(sha string) ([]byte, error) {
+		return gitLooseObject(src, sha)
+	}, objectstore.TXT); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	helper := buildHelper(t)
+	dest := filepath.Join(t.TempDir(), "clone")
+	cmd := exec.Command("git", "clone", "-q", "dns://"+root, dest)
+	cmd.Env = append(os.Environ(),
+		"GIT_REMOTE_DNS_SERVER=127.0.0.1:"+strconv.Itoa(srv.Port()),
+		"GIT_REMOTE_DNS_ZONE="+zone,
+		"GIT_REMOTE_DNS_TRACE=",
+		"TMPDIR="+tmp,
+		"PATH="+filepath.Dir(helper)+":"+os.Getenv("PATH"),
+	)
+	cmd.Env = append(cmd.Env, extraEnv...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git clone: %v\n%s", err, out)
+	}
+	if got := runGit(t, dest, "rev-parse", "HEAD"); got != root {
+		t.Fatalf("clone HEAD = %s, want %s", got, root)
+	}
+	return string(out)
+}
+
+// TestCloneLeavesNoTempRepo clones with the helper's TMPDIR pointed at an
+// empty directory. The helper used to leave a git-remote-dns-* repository
+// holding every fetched object behind on each fetch.
+func TestCloneLeavesNoTempRepo(t *testing.T) {
+	tmp := t.TempDir()
+	cloneOverDNS(t, tmp)
+	entries, err := os.ReadDir(tmp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "git-remote-dns-") {
+			t.Fatalf("helper left %s in TMPDIR", e.Name())
+		}
+	}
+}
+
+// TestCloneIsQuietUnlessTraced checks a normal clone prints nothing from the
+// helper, and GIT_REMOTE_DNS_TRACE turns the protocol log back on.
+func TestCloneIsQuietUnlessTraced(t *testing.T) {
+	if out := cloneOverDNS(t, t.TempDir()); strings.Contains(out, "<<") || strings.Contains(out, ">>") {
+		t.Fatalf("untraced clone printed protocol lines:\n%s", out)
+	}
+	out := cloneOverDNS(t, t.TempDir(), "GIT_REMOTE_DNS_TRACE=1")
+	for _, want := range []string{"<< capabilities", "<< list", ">> fetch shas:"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("traced clone output missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestBuildPackRemovesTempRepo checks buildPack cleans up after itself.
+func TestBuildPackRemovesTempRepo(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("TMPDIR", tmp)
+	raw := []byte("blob 5\x00hello")
+	o, err := gitobj.ReadObject(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &helper{}
+	pack, err := h.buildPack(map[string]*gitobj.Object{o.SHA: o})
+	if err != nil {
+		t.Fatalf("buildPack: %v", err)
+	}
+	if len(pack) < 4 || string(pack[:4]) != "PACK" {
+		t.Fatal("buildPack did not return a pack")
+	}
+	entries, _ := os.ReadDir(tmp)
+	if len(entries) != 0 {
+		t.Fatalf("buildPack left %d entries in TMPDIR", len(entries))
+	}
 }
