@@ -28,8 +28,23 @@ const (
 	// ManifestVersion is the current manifest format version.
 	ManifestVersion = 1
 
-	// DefaultChunkSize is the logical chunk size in bytes.
-	DefaultChunkSize = 1024
+	// DefaultChunkSize is the logical chunk size in bytes. 512 bytes keeps a
+	// chunk's answer under the 1232-byte EDNS buffer that is safe on the
+	// internet (DNS flag day 2020) over both transports: about 800 bytes as
+	// TXT and 1075 bytes as AAAA (35 compressed records), with room for a
+	// zone name of roughly 150 characters.
+	DefaultChunkSize = 512
+
+	// MaxRecordPayload is the largest payload stored in a single DNS record
+	// set. Chunks are at most this size, and a manifest larger than this is
+	// stored indirectly (see IndirectManifest).
+	MaxRecordPayload = DefaultChunkSize
+
+	// MaxIndirection bounds how many levels of indirect manifests a client
+	// follows. Each level shrinks a manifest about eightfold, so 16 levels
+	// covers any realistic object while capping work a hostile server can
+	// cause.
+	MaxIndirection = 16
 
 	// TXTCharStrMax is the max bytes per DNS TXT character-string (RFC 1035).
 	TXTCharStrMax = 255
@@ -83,6 +98,11 @@ type Manifest struct {
 	ChunkIDs   []ObjectID     `json:"chunkIDs"`
 	ChunkLens  []int64        `json:"chunkLens"`
 	Meta       map[string]any `json:"meta,omitempty"`
+	// Indirect marks a manifest whose chunks reassemble to another manifest
+	// rather than to object data. It is only set on the manifests
+	// IndirectManifest creates; an object's own manifest never has it, so
+	// object ids are unaffected.
+	Indirect bool `json:"indirect,omitempty"`
 }
 
 // Bytes returns the canonical manifest bytes (used as the manifest's own ID).
@@ -180,6 +200,29 @@ func Build(data []byte) (*Manifest, [][]byte) {
 	}, chunks
 }
 
+// IndirectManifest returns a record payload of at most MaxRecordPayload bytes
+// that stands for the manifest bytes mb. When mb fits it is returned as is;
+// otherwise mb is chunked and described by an Indirect manifest, repeating
+// until the outermost manifest fits. ids and chunks are the extra chunks (the
+// pieces of each inner manifest) that must be published alongside the record.
+// A client follows the chain back down to mb, verifying every chunk hash on
+// the way.
+func IndirectManifest(mb []byte) (record []byte, ids []ObjectID, chunks [][]byte, err error) {
+	for depth := 0; len(mb) > MaxRecordPayload; depth++ {
+		if depth == MaxIndirection {
+			return nil, nil, nil, fmt.Errorf("objectstore: manifest needs more than %d levels of indirection", MaxIndirection)
+		}
+		m, cs := Build(mb)
+		m.Indirect = true
+		ids = append(ids, m.ChunkIDs...)
+		chunks = append(chunks, cs...)
+		if mb, err = m.Bytes(); err != nil {
+			return nil, nil, nil, fmt.Errorf("objectstore: marshal indirect manifest: %w", err)
+		}
+	}
+	return mb, ids, chunks, nil
+}
+
 // Frame is one chunk's payload plus its position within the object.
 type Frame struct {
 	Index   int
@@ -248,6 +291,9 @@ func DecodeTXT(records []string) ([]byte, error) {
 // EncodeAAAA encodes a frame into AAAA addresses. The top byte of each 16-byte
 // address is the sequence number; the low 15 bytes carry the payload. Records
 // may be returned in any order by a resolver; the sequence byte restores it.
+//
+// The sequence number is one byte, so a payload must stay under 256 records
+// (about 3.8 KB); callers keep payloads within MaxRecordPayload.
 //
 // The payload is prefixed with its 4-byte big-endian length. AAAA right-pads
 // the final record with null bytes, which is ambiguous with content that

@@ -345,3 +345,64 @@ func TestBuildPackRemovesTempRepo(t *testing.T) {
 		t.Fatalf("buildPack left %d entries in TMPDIR", len(entries))
 	}
 }
+
+// TestGitRemoteDNSCloneLargeFile clones, over both transports, a real
+// repository holding a 1 MB file. Before git objects were chunked this failed
+// over TXT (the blob did not fit a DNS message) and over AAAA (the record
+// sequence wrapped and the blob came back with the wrong SHA).
+func TestGitRemoteDNSCloneLargeFile(t *testing.T) {
+	const zone = "example.com"
+	src := t.TempDir()
+	runGit(t, src, "init", "-q", "-b", "main")
+	big := make([]byte, 1<<20)
+	for i := range big {
+		big[i] = byte(i*31 + i/509)
+	}
+	if err := os.WriteFile(filepath.Join(src, "big.bin"), big, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "small.txt"), []byte("small\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, src, "add", "-A")
+	runGit(t, src, "commit", "-q", "-m", "large file")
+	root := runGit(t, src, "rev-parse", "HEAD")
+	helper := buildHelper(t)
+
+	for _, tr := range []struct {
+		name string
+		tr   objectstore.Transport
+	}{{"txt", objectstore.TXT}, {"aaaa", objectstore.AAAA}} {
+		t.Run(tr.name, func(t *testing.T) {
+			srv := dnszone.NewServer(dnszone.Zone(zone), dnszone.DefaultTTL)
+			if err := srv.Start("127.0.0.1:0"); err != nil {
+				t.Fatalf("start server: %v", err)
+			}
+			defer srv.Shutdown()
+			if err := gitdns.Publish(srv, root, func(sha string) ([]byte, error) {
+				return gitLooseObject(src, sha)
+			}, tr.tr); err != nil {
+				t.Fatalf("publish: %v", err)
+			}
+			dest := filepath.Join(t.TempDir(), "clone")
+			cmd := exec.Command("git", "clone", "-q", "dns://"+root, dest)
+			cmd.Env = append(os.Environ(),
+				"GIT_REMOTE_DNS_SERVER=127.0.0.1:"+strconv.Itoa(srv.Port()),
+				"GIT_REMOTE_DNS_ZONE="+zone,
+				"GIT_REMOTE_DNS_TRANSPORT="+tr.name,
+				"PATH="+filepath.Dir(helper)+":"+os.Getenv("PATH"),
+			)
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("git clone: %v\n%s", err, out)
+			}
+			got, err := os.ReadFile(filepath.Join(dest, "big.bin"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, big) {
+				t.Fatal("cloned big.bin differs from the source")
+			}
+			runGit(t, dest, "fsck", "--no-dangling")
+		})
+	}
+}

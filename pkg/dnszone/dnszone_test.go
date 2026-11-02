@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/miekg/dns"
@@ -61,28 +62,36 @@ func TestEndToEndRoundTrip(t *testing.T) {
 	}
 }
 
-// TestEndToEndTruncateAAAA exercises the resolver's TCP fallback: a single
-// large chunk whose AAAA encoding exceeds the 4 KB EDNS0 buffer forces the
-// server to truncate the UDP answer, so the resolver re-issues over TCP.
+// TestEndToEndTruncateAAAA exercises the resolver's TCP fallback. Chunk
+// answers fit the 1232-byte EDNS0 buffer for ordinary zones, but under a
+// zone name near the 253-character limit a full AAAA chunk answer does not,
+// so the server truncates the UDP answer (setting TC) and the resolver
+// re-issues over TCP.
 func TestEndToEndTruncateAAAA(t *testing.T) {
-	srv, res, shutdown := newTestServer(t, objectstore.AAAA)
-	defer shutdown()
-
-	// A single ~3 KB chunk: its AAAA encoding (15 payload bytes per 16-byte
-	// record) is 201 records, so the UDP answer exceeds the 4 KB EDNS0 buffer
-	// and the server truncates it (setting the TC bit); the resolver then
-	// re-issues over TCP. The chunk stays under 256 records so the 1-byte
-	// sequence number in each AAAA record does not overflow.
-	data := randBytes(3000)
-	m := &objectstore.Manifest{
-		Version:    objectstore.ManifestVersion,
-		TotalSize:  int64(len(data)),
-		ChunkCount: 1,
-		ChunkIDs:   []objectstore.ObjectID{objectstore.ChunkID(data)},
-		ChunkLens:  []int64{int64(len(data))},
+	zone := Zone(strings.Repeat(strings.Repeat("z", 60)+".", 3) + "example.com")
+	srv := NewServer(zone, 0)
+	if err := srv.Start("127.0.0.1:0"); err != nil {
+		t.Fatal(err)
 	}
-	if err := srv.Publish(m, [][]byte{data}, objectstore.AAAA); err != nil {
+	defer srv.Shutdown()
+	addr := "127.0.0.1:" + strconv.Itoa(srv.Port())
+	res := NewResolver(addr, zone, 0)
+
+	data := randBytes(3 * objectstore.DefaultChunkSize)
+	m, chunks := objectstore.Build(data)
+	if err := srv.Publish(m, chunks, objectstore.AAAA); err != nil {
 		t.Fatalf("publish: %v", err)
+	}
+	// Confirm a chunk answer really is truncated over UDP at 1232 bytes.
+	q := new(dns.Msg)
+	q.SetQuestion(srv.chunkName(m.ChunkIDs[0]), dns.TypeAAAA)
+	q.SetEdns0(ednsUDPSize, false)
+	udp, _, err := (&dns.Client{Net: "udp", UDPSize: ednsUDPSize}).Exchange(q, addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !udp.Truncated {
+		t.Fatal("chunk answer under a long zone was not truncated; the TCP path is untested")
 	}
 	got, err := res.Fetch(m, objectstore.AAAA)
 	if err != nil {
@@ -270,21 +279,18 @@ func TestGitSchemeRawRoundTrip(t *testing.T) {
 				t.Fatal("fetch succeeded after Forget, want not-found")
 			}
 
-			// Re-publish and tamper; CorruptAt flips a byte in a TXT piece, so it
-			// only applies to the TXT transport.
+			// Re-publish and tamper with the payload's chunk; CorruptAt flips a
+			// byte in a TXT piece, so it only applies to the TXT transport. The
+			// chunk no longer matches its hash, so the fetch fails.
 			if tr == objectstore.TXT {
 				if err := srv.PublishRaw(fqdn, want, tr); err != nil {
 					t.Fatalf("re-publish raw: %v", err)
 				}
-				if err := srv.CorruptAt(fqdn); err != nil {
+				if err := srv.CorruptAt(srv.chunkName(objectstore.ChunkID(want))); err != nil {
 					t.Fatalf("corrupt at: %v", err)
 				}
-				got, err = git.FetchRaw(id, tr)
-				if err != nil {
-					t.Fatalf("fetch raw after corrupt: %v", err)
-				}
-				if bytes.Equal(got, want) {
-					t.Fatal("corrupt had no effect, want differing bytes")
+				if got, err := git.FetchRaw(id, tr); err == nil {
+					t.Fatalf("fetch raw after corrupt returned %q, want hash mismatch", got)
 				}
 			}
 		})
@@ -501,10 +507,9 @@ func TestCorruptUnknown(t *testing.T) {
 }
 
 // TestCorruptAAAA ensures CorruptAAAA flips a payload octet in an AAAA record
-// so the decoded content no longer matches the original, which is what lets a
-// caller detect the tampering. TXT records are covered by CorruptAt; AAAA is
-// decoded without base64, so a flipped octet changes content rather than
-// breaking decoding.
+// so the decoded chunk no longer matches its hash and the fetch fails. TXT
+// records are covered by CorruptAt; AAAA is decoded without base64, so a
+// flipped octet changes content rather than breaking decoding.
 func TestCorruptAAAA(t *testing.T) {
 	srv, res, shutdown := newTestServer(t, objectstore.AAAA)
 	defer shutdown()
@@ -515,14 +520,10 @@ func TestCorruptAAAA(t *testing.T) {
 	if err := srv.PublishRaw(fqdn, payload, objectstore.AAAA); err != nil {
 		t.Fatalf("publish: %v", err)
 	}
-	srv.CorruptAAAA(fqdn)
+	srv.CorruptAAAA(srv.chunkName(objectstore.ChunkID(payload)))
 
-	got, err := res.WithObjectSuffix("f").FetchRaw(id, objectstore.AAAA)
-	if err != nil {
-		t.Fatalf("fetch: %v", err)
-	}
-	if bytes.Equal(got, payload) {
-		t.Fatal("fetch returned original payload after CorruptAAAA, want corrupted bytes")
+	if got, err := res.WithObjectSuffix("f").FetchRaw(id, objectstore.AAAA); err == nil {
+		t.Fatalf("fetch returned %q after CorruptAAAA, want hash mismatch", got)
 	}
 }
 

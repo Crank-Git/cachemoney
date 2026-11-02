@@ -71,31 +71,55 @@ func (s *Server) Port() int {
 
 // Publish frames an already-built object into the zone. The manifest is
 // served at <id>.o.<zone> and each chunk at <chunkid>.c.<zone>, using the
-// given transport for every record.
+// given transport for every record. A manifest too large for one record is
+// stored indirectly (objectstore.IndirectManifest).
 func (s *Server) Publish(m *objectstore.Manifest, chunks [][]byte, tr objectstore.Transport) error {
-	mb, err := m.Bytes()
-	if err != nil {
-		return fmt.Errorf("marshal manifest: %w", err)
+	return s.publishObject(s.manifestName(m.ID()), m, chunks, tr)
+}
+
+// PublishRaw publishes payload as an object stored under the fully-qualified
+// name fqdn rather than under its manifest id: payload is chunked into
+// <chunkid>.c.<zone> records and fqdn holds its manifest, so payloads of any
+// size are served within the per-record limit. It is the hook the git and
+// mirror schemes use to publish an object under <sha>.g.<zone> or
+// <hash>.f.<zone>; Resolver.FetchRaw reads it back.
+func (s *Server) PublishRaw(fqdn string, payload []byte, tr objectstore.Transport) error {
+	m, chunks := objectstore.Build(payload)
+	if err := s.publishObject(fqdn, m, chunks, tr); err != nil {
+		return fmt.Errorf("dnszone: publish raw %s: %w", fqdn, err)
 	}
-	if err := s.store(s.manifestName(m.ID()), mb, tr); err != nil {
-		return fmt.Errorf("publish manifest: %w", err)
-	}
+	return nil
+}
+
+// publishObject stores an object's chunks and then its manifest at fqdn.
+func (s *Server) publishObject(fqdn string, m *objectstore.Manifest, chunks [][]byte, tr objectstore.Transport) error {
 	for i, c := range chunks {
 		id := m.ChunkIDs[i]
 		if err := s.store(s.chunkName(id), c, tr); err != nil {
 			return fmt.Errorf("publish chunk %s: %w", id, err)
 		}
 	}
-	return nil
+	mb, err := m.Bytes()
+	if err != nil {
+		return fmt.Errorf("marshal manifest: %w", err)
+	}
+	return s.publishManifestBytes(fqdn, mb, tr)
 }
 
-// PublishRaw stores a raw payload under the fully-qualified name fqdn using
-// the given transport. Unlike Publish it does not frame a manifest or chunks;
-// it hands the payload straight to the record store. It is the hook the git
-// scheme uses to publish a raw git object under <sha>.g.<zone>.
-func (s *Server) PublishRaw(fqdn string, payload []byte, tr objectstore.Transport) error {
-	if err := s.store(fqdn, payload, tr); err != nil {
-		return fmt.Errorf("dnszone: publish raw %s: %w", fqdn, err)
+// publishManifestBytes stores manifest bytes at fqdn, going through
+// objectstore.IndirectManifest so the record stays within MaxRecordPayload.
+func (s *Server) publishManifestBytes(fqdn string, mb []byte, tr objectstore.Transport) error {
+	record, ids, chunks, err := objectstore.IndirectManifest(mb)
+	if err != nil {
+		return err
+	}
+	for i, c := range chunks {
+		if err := s.store(s.chunkName(ids[i]), c, tr); err != nil {
+			return fmt.Errorf("publish manifest chunk %s: %w", ids[i], err)
+		}
+	}
+	if err := s.store(fqdn, record, tr); err != nil {
+		return fmt.Errorf("publish manifest: %w", err)
 	}
 	return nil
 }
@@ -134,7 +158,7 @@ func (s *Server) LoadStore(dir string, tr objectstore.Transport) error {
 		// The manifest's address is the hash of the bytes served, so derive it
 		// from the file as stored rather than from a re-marshaled copy.
 		id := objectstore.ObjectID(objectstore.ToLabel(objectstore.HashBytes(mb)))
-		if err := s.store(s.manifestName(id), mb, tr); err != nil {
+		if err := s.publishManifestBytes(s.manifestName(id), mb, tr); err != nil {
 			return fmt.Errorf("dnszone: store manifest %s: %w", id, err)
 		}
 		for i, cid := range m.ChunkIDs {
@@ -219,8 +243,13 @@ func (s *Server) corruptRecord(fqdn string) error {
 	return nil
 }
 
-// store records a payload under fqdn using the given transport.
+// store records a payload under fqdn using the given transport. Payloads over
+// objectstore.MaxRecordPayload are refused so every answer stays small enough
+// for one UDP datagram and the AAAA sequence byte cannot wrap.
 func (s *Server) store(fqdn string, payload []byte, tr objectstore.Transport) error {
+	if len(payload) > objectstore.MaxRecordPayload {
+		return fmt.Errorf("dnszone: %d-byte payload for %s exceeds the %d-byte record limit", len(payload), fqdn, objectstore.MaxRecordPayload)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	switch tr {
@@ -332,6 +361,9 @@ func (s *Server) handle(w dns.ResponseWriter, req *dns.Msg) {
 	if _, isTCP := w.RemoteAddr().(*net.TCPAddr); !isTCP {
 		if opt := req.IsEdns0(); opt != nil {
 			m.Truncate(int(opt.UDPSize()))
+			// Truncate turns compression off when the uncompressed answer
+			// fits; keep it on so a large buffer never costs extra bytes.
+			m.Compress = true
 		}
 	}
 	_ = w.WriteMsg(m)

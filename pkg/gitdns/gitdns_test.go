@@ -236,3 +236,46 @@ func TestPublishFetchWithGitlink(t *testing.T) {
 		})
 	}
 }
+
+// TestPublishFetchLargeBlob round-trips a commit holding a 1 MB blob. Git
+// objects used to be published as one record: over TXT anything past ~47 KB
+// could not fit a DNS message, and over AAAA anything past ~3.8 KB wrapped
+// the sequence byte and came back as a different object.
+func TestPublishFetchLargeBlob(t *testing.T) {
+	for _, tr := range []objectstore.Transport{objectstore.TXT, objectstore.AAAA} {
+		t.Run("transport="+strconv.Itoa(int(tr)), func(t *testing.T) {
+			blob := make([]byte, 1<<20)
+			for i := range blob {
+				blob[i] = byte(i*7 + i/251)
+			}
+			objects := map[string][]byte{}
+			blobSHA := gitobj.ObjectSHA(gitobj.Blob, blob)
+			objects[blobSHA] = rawBytes(gitobj.Blob, blob)
+			tree := gitobj.MarshalTree([]gitobj.Entry{{Mode: "100644", Name: "big.bin", SHA: blobSHA}})
+			treeSHA := gitobj.ObjectSHA(gitobj.Tree, tree)
+			objects[treeSHA] = rawBytes(gitobj.Tree, tree)
+			commit := []byte("tree " + treeSHA + "\nauthor A <a@x> 0 +0000\ncommitter A <a@x> 0 +0000\n\nbig\n")
+			commitSHA := gitobj.ObjectSHA(gitobj.Commit, commit)
+			objects[commitSHA] = rawBytes(gitobj.Commit, commit)
+
+			srv := dnszone.NewServer(dnszone.Zone("example.com"), 0)
+			if err := srv.Start("127.0.0.1:0"); err != nil {
+				t.Fatal(err)
+			}
+			defer srv.Shutdown()
+			if err := Publish(srv, commitSHA, func(sha string) ([]byte, error) {
+				return objects[sha], nil
+			}, tr); err != nil {
+				t.Fatalf("Publish: %v", err)
+			}
+			r := dnszone.NewResolver("127.0.0.1:"+strconv.Itoa(srv.Port()), dnszone.Zone("example.com"), 0).WithObjectSuffix("g")
+			got, err := Fetch(r, commitSHA, tr)
+			if err != nil {
+				t.Fatalf("Fetch: %v", err)
+			}
+			if o := got[blobSHA]; o == nil || string(o.Raw) != string(objects[blobSHA]) {
+				t.Fatal("large blob did not round-trip")
+			}
+		})
+	}
+}

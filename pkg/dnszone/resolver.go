@@ -18,6 +18,11 @@ import (
 	"github.com/Crank-Git/cachemoney/pkg/objectstore"
 )
 
+// ednsUDPSize is the UDP buffer the resolver advertises: 1232 bytes, the size
+// that avoids IP fragmentation on the internet (DNS flag day 2020). Records are
+// sized to fit it; anything larger is truncated and retried over TCP.
+const ednsUDPSize = 1232
+
 // defaultConcurrency is the number of chunk fetches run in parallel while
 // walking an object graph. Chunks are content-addressed, so they can be
 // fetched independently and reassembled in any order.
@@ -82,8 +87,8 @@ func NewResolver(server string, zone Zone, timeout time.Duration) *Resolver {
 }
 
 // newClient builds the underlying dns.Client for the resolver's configured
-// network. For UDP it advertises a 4 KB EDNS0 buffer so large answers fit in a
-// single datagram; for TCP and DoT the reliable connection is used directly.
+// network. For UDP it sizes the read buffer to the advertised EDNS0 size; for
+// TCP and DoT the reliable connection is used directly.
 func (r *Resolver) newClient() *dns.Client {
 	c := &dns.Client{Timeout: r.timeout}
 	switch r.net {
@@ -98,7 +103,7 @@ func (r *Resolver) newClient() *dns.Client {
 		c.Net = "tcp"
 	default:
 		c.Net = "udp"
-		c.UDPSize = 4096
+		c.UDPSize = ednsUDPSize
 	}
 	return c
 }
@@ -262,13 +267,11 @@ func (r *Resolver) FetchByID(id objectstore.ObjectID, tr objectstore.Transport) 
 }
 
 // resolveManifest fetches the manifest for the given id from the server and
-// verifies it: the bytes must hash to id and describe a consistent object, or
-// the manifest is rejected before any chunk is fetched. The framing
-// (DecodeTXT/DecodeAAAA) returns the payload exactly: the AAAA length prefix
-// disambiguates the right-padding of the final record from content, so
-// nothing is trimmed.
+// verifies it: the object's manifest bytes must hash to id and describe a
+// consistent object, or the manifest is rejected before any of the object's
+// chunks are fetched.
 func (r *Resolver) resolveManifest(id objectstore.ObjectID, tr objectstore.Transport) (*objectstore.Manifest, uint32, error) {
-	raw, ttl, err := r.fetch(dns.Fqdn(fmt.Sprintf("%s.%s.%s", id, r.suffix, r.zone)), tr)
+	_, raw, ttl, err := r.resolveManifestAt(r.objectName(string(id)), tr)
 	if err != nil {
 		return nil, 0, fmt.Errorf("fetch manifest %s: %w", id, err)
 	}
@@ -277,6 +280,40 @@ func (r *Resolver) resolveManifest(id objectstore.ObjectID, tr objectstore.Trans
 		return nil, 0, fmt.Errorf("verify manifest %s: %w", id, err)
 	}
 	return m, ttl, nil
+}
+
+// resolveManifestAt fetches the manifest record at name and follows indirect
+// manifests (objectstore.IndirectManifest) down to the object's own manifest,
+// at most objectstore.MaxIndirection levels. Every inner manifest is
+// reassembled from hash-verified chunks. It returns the object's manifest,
+// its exact bytes, and the TTL of the record at name. The framing
+// (DecodeTXT/DecodeAAAA) returns payloads exactly: the AAAA length prefix
+// disambiguates the right-padding of the final record from content.
+func (r *Resolver) resolveManifestAt(name string, tr objectstore.Transport) (*objectstore.Manifest, []byte, uint32, error) {
+	raw, ttl, err := r.fetch(name, tr)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	for depth := 0; ; depth++ {
+		m, err := objectstore.UnmarshalManifest(raw)
+		if err != nil {
+			return nil, nil, 0, err
+		}
+		if !m.Indirect {
+			return m, raw, ttl, nil
+		}
+		if depth == objectstore.MaxIndirection {
+			return nil, nil, 0, fmt.Errorf("dnszone: %s: more than %d levels of indirect manifests", name, objectstore.MaxIndirection)
+		}
+		if raw, err = r.walk(m, tr); err != nil {
+			return nil, nil, 0, fmt.Errorf("indirect manifest: %w", err)
+		}
+	}
+}
+
+// objectName is the fully-qualified name of id under the resolver's scheme.
+func (r *Resolver) objectName(id string) string {
+	return dns.Fqdn(fmt.Sprintf("%s.%s.%s", id, r.suffix, r.zone))
 }
 
 // walk fetches every chunk of m, reassembles it, and verifies every hash. A
@@ -314,12 +351,11 @@ func (r *Resolver) walk(m *objectstore.Manifest, tr objectstore.Transport) ([]by
 // exchange performs one DNS query, falling back to TCP if the UDP answer is
 // truncated (which happens for large AAAA sets). UDP is preferred for latency.
 func (r *Resolver) exchange(m *dns.Msg) (*dns.Msg, error) {
-	// Advertise a 4 KB UDP buffer via EDNS0 so the server can return a large
-	// answer in one datagram and, when it cannot, truncate and set the TC bit
-	// that drives the TCP fallback below. Without EDNS0 a query falls back to
-	// the 512-byte historic limit and the oversized response fragments on the
-	// wire instead of arriving with the truncation bit set.
-	m.SetEdns0(4096, false)
+	// Advertise a 1232-byte UDP buffer via EDNS0 so a chunk answer arrives in
+	// one unfragmented datagram and, when an answer cannot fit, the server
+	// truncates and sets the TC bit that drives the TCP fallback below.
+	// Without EDNS0 a query falls back to the 512-byte historic limit.
+	m.SetEdns0(ednsUDPSize, false)
 	// DNS over HTTPS is served over a reliable HTTP connection, so it needs no
 	// UDP buffer or truncation handling: the packed query is POSTed and the
 	// packed response is unpacked in exchangeDoH.
@@ -388,18 +424,23 @@ func (r *Resolver) exchangeTCP(m *dns.Msg) (*dns.Msg, error) {
 	return resp, nil
 }
 
-// FetchRaw fetches the raw bytes stored under <id>.<suffix>.<zone> without
-// interpreting them as a manifest. It is used for the git scheme, whose payload
-// is a raw object rather than a cachemoney manifest, so unlike resolveManifest
-// the bytes are returned verbatim (no JSON parse). The framing returns the
-// payload exactly, so content that ends in a null byte is preserved. id is the
-// bare object id (e.g. a git SHA), not a fully-qualified name.
+// FetchRaw fetches the object Server.PublishRaw stored under
+// <id>.<suffix>.<zone>: it follows the manifest there and reassembles the
+// object's chunks, verifying each chunk hash. id is the bare id (e.g. a git
+// SHA), not a fully-qualified name. Unlike FetchByID the manifest is not
+// addressed by its own hash, so the caller verifies the returned bytes
+// against id (the git scheme checks the SHA-1, the mirror scheme the
+// sha256).
 func (r *Resolver) FetchRaw(id string, tr objectstore.Transport) ([]byte, error) {
-	raw, _, err := r.fetch(dns.Fqdn(fmt.Sprintf("%s.%s.%s", id, r.suffix, r.zone)), tr)
+	m, _, _, err := r.resolveManifestAt(r.objectName(id), tr)
 	if err != nil {
 		return nil, fmt.Errorf("dnszone: fetch %s: %w", id, err)
 	}
-	return raw, nil
+	data, err := r.walk(m, tr)
+	if err != nil {
+		return nil, fmt.Errorf("dnszone: fetch %s: %w", id, err)
+	}
+	return data, nil
 }
 
 // store records obj in the resolver's cache, if one is configured, for the
