@@ -29,6 +29,9 @@ const (
 	Tree Kind = "tree"
 	// Commit references a tree, parents, and metadata.
 	Commit Kind = "commit"
+	// Tag is an annotated tag. Walk does not follow tags; they are accepted
+	// so a tag object can be read and verified.
+	Tag Kind = "tag"
 )
 
 // GitlinkMode is the tree-entry mode of a gitlink: a submodule pointer whose
@@ -178,6 +181,9 @@ func ParseCommit(raw []byte) (*Object, error) {
 
 // ReadObject inspects the raw bytes of a Git object, verifies its content
 // length, computes and returns its SHA-1, and parses the kind-specific fields.
+// The header must be canonical ("<kind> <decimal size>\x00" with a known kind
+// and no sign or leading zeros): the SHA-1 is computed over that canonical
+// form, so any other spelling would yield bytes that do not hash to SHA.
 func ReadObject(raw []byte) (*Object, error) {
 	nul := bytes.IndexByte(raw, 0)
 	if nul < 0 {
@@ -188,9 +194,17 @@ func ReadObject(raw []byte) (*Object, error) {
 	if !ok {
 		return nil, fmt.Errorf("gitobj: malformed header %q", header)
 	}
+	switch Kind(kind) {
+	case Blob, Tree, Commit, Tag:
+	default:
+		return nil, fmt.Errorf("gitobj: unknown object kind %q", kind)
+	}
 	size, err := strconv.Atoi(sizeStr)
 	if err != nil {
 		return nil, fmt.Errorf("gitobj: bad size %q: %w", sizeStr, err)
+	}
+	if size < 0 || strconv.Itoa(size) != sizeStr {
+		return nil, fmt.Errorf("gitobj: non-canonical size %q", sizeStr)
 	}
 	content := raw[nul+1:]
 	if len(content) != size {
