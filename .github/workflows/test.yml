@@ -6,8 +6,10 @@ on:
   pull_request:
     branches: [dev, main]
 
+# Each job is a separate status check; main's branch protection requires
+# build, format, test, and vet by these names.
 jobs:
-  test:
+  build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -20,8 +22,41 @@ jobs:
       - name: Build
         run: go build ./...
 
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.27'
+
       - name: Format (gofmt)
         run: test -z "$(gofmt -l $(find . -name '*.go' -not -path './vendor/*'))" && echo "gofmt clean"
+
+  vet:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.27'
+
+      - name: Vet
+        run: go vet ./...
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.27'
 
       - name: Install unbound (recursive resolver integration test)
         run: |
@@ -38,9 +73,6 @@ jobs:
         env:
           CACHEMONEY_REQUIRE_UNBOUND: "1"
         run: go test -race -coverprofile=coverage.out ./...
-
-      - name: Vet
-        run: go vet ./...
 
       - name: Coverage gate
         run: |
