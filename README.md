@@ -11,10 +11,8 @@ long TTLs turn every resolver on Earth into a free CDN.
   that fetched `<id>` once can serve it forever; the bytes can't drift.
 - **Every resolver is a free CDN.** With long TTLs on immutable objects, a single
   origin is served by millions of cached copies.
-- **Refs would be the only mutable, short-TTL records.** A name like
-  `main.refs.<repo>` would point at a commit, with everything behind it immutable.
-  Refs are not implemented yet (see [Open questions](#open-questions)); today a
-  repository is cloned by commit SHA.
+- **Refs are the only mutable, short-TTL records.** `<repo>.refs.<zone>` lists a
+  repository's branches and tags; everything they point at is immutable.
 
 ## How addressing works
 
@@ -26,12 +24,14 @@ repos, with manifests):
 <id>.o.<zone>                 # a generic object's manifest, addressed by the manifest's hash
 <gitsha>.g.<zone>             # a git object's manifest, addressed by its git SHA-1
 <sha256>.f.<zone>             # a mirror file's (or index's) manifest, addressed by its sha256
+<repo>.refs.<zone>            # a repository's ref list (mutable, 60 s TTL)
 ```
 
 A client walks the graph:
 
-1. start from a commit SHA (`git clone dns://<sha>`)
-2. fetch the commit's manifest at `<gitsha>.g`, then its chunks
+1. resolve `<repo>.refs` → the branches, tags, and HEAD (or start from a commit
+   SHA with `git clone dns://<sha>`)
+2. fetch each commit's manifest at `<gitsha>.g`, then its chunks
 3. fetch the tree, blobs, and parents the same way, many at once
 4. verify every chunk hash, and every git object's SHA-1, before trusting bytes
 
@@ -57,32 +57,47 @@ NXDOMAIN, REFUSED outside the zone, EDNS0). The test suite runs it behind a real
 Unbound resolver with 0x20 case randomization and QNAME minimization, including
 serving objects from the resolver's cache with the origin shut down.
 
-### Cloning a repository over DNS (`git clone dns:<sha>`)
+### Cloning a repository over DNS (`git clone dns://<repo>`)
 
 Git can clone a repository whose objects are served over DNS instead of HTTP,
 SSH, or SFTP. On demand it spawns a `git-remote-dns` helper; you point the
-helper at a DNS server and the zone to serve, and `git clone dns:<sha>`
-resolves that commit and streams back the reachable objects.
+helper at a DNS server and the zone to serve, and `git clone dns://<repo>`
+reads the repository's refs and streams back the reachable objects.
 
 ```sh
 # Server: publish a repository's branches, tags, and history and serve them,
 # re-reading the repository every 30 s (-refresh)
 cachemoney serve-git -repo path/to/repo -name myrepo -zone example.com -addr 127.0.0.1:5300
 
-# Client: clone by commit SHA (serve-git prints this command)
-GIT_REMOTE_DNS_ZONE=example.com \
-GIT_REMOTE_DNS_SERVER=127.0.0.1:5300 \
+# Client: clone by name (serve-git prints this command); later pulls fetch
+# only new objects
+export GIT_REMOTE_DNS_ZONE=example.com GIT_REMOTE_DNS_SERVER=127.0.0.1:5300
+git clone dns://myrepo
+git -C myrepo pull
+
+# Or clone the history of one commit by SHA
 git clone dns://0123456789abcdef0123456789abcdef01234567
 ```
+
+`serve-git` publishes every branch and tag plus HEAD. Objects go out before
+the ref list that points at them, so a client never sees a ref whose objects
+are missing. A repository name is one lowercase DNS label.
+
+**Trust.** Every object is verified by its SHA, but the ref list is not
+content-addressed: which commit a branch names is only as trustworthy as the
+DNS path that delivered it (see [Open questions](#open-questions)).
 
 From Go, `gitdns.Publish(server, sha, fetch, transport)` publishes a graph given
 a `fetch` that returns an object's raw, uncompressed bytes
 (`"<type> <size>\x00<content>"`, as `git cat-file --batch` provides).
 
-git launches the helper as `git-remote-dns <remote> dns://<sha>`. It answers:
+git launches the helper as `git-remote-dns <remote> dns://<repo-or-sha>`. It
+answers:
 
-- `list` — the commit SHA plus a HEAD symref to `refs/heads/main`.
-- `fetch` — the reachable objects, materialized into git's object store via
+- `list` — the repository's ref list as published (by SHA: that commit as
+  `refs/heads/main` plus a HEAD symref to it).
+- `fetch` — every object reachable from the requested refs that the local
+  repository does not already have, materialized into git's object store via
   `git unpack-objects` (git's fetch path never consumes the pack the helper
   emits).
 
@@ -154,8 +169,8 @@ All planned work is complete:
 ## Open questions
 
 - Which TLD/zone hosts the records, and how contributors publish authoritatively.
-- Mutable refs (`main.refs.<repo>`, short TTL) so a repository can be cloned by
-  name rather than by commit SHA.
+- Ref authenticity: refs are the one record not verified by hash. Signed ref
+  lists or DNSSEC would let a client trust which commit a branch names.
 
 ## License
 

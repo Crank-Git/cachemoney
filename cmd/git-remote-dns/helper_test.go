@@ -48,15 +48,35 @@ func TestParseURL(t *testing.T) {
 	}
 }
 
-// TestParseURLErrors checks the malformed inputs that must be rejected: wrong
-// length and non-hex characters.
+// TestParseURLRepoNames checks that anything other than a 40-hex SHA is read
+// as a repository name, lowercased.
+func TestParseURLRepoNames(t *testing.T) {
+	cases := map[string]string{
+		"dns://abc":                         "abc",
+		"dns::cachemoney":                   "cachemoney",
+		"dns://My-Repo/":                    "my-repo",
+		"dns://" + strings.Repeat("a", 41):  strings.Repeat("a", 41),
+		"dns://" + strings.Repeat("z", 40):  strings.Repeat("z", 40),
+		"dns://" + strings.ToUpper(testSHA): testSHA,
+	}
+	for in, want := range cases {
+		got, err := parseURL(in)
+		if err != nil || got != want {
+			t.Fatalf("parseURL(%q) = %q, %v; want %q", in, got, err, want)
+		}
+	}
+}
+
+// TestParseURLErrors checks inputs that are neither a SHA nor a valid
+// repository name are rejected.
 func TestParseURLErrors(t *testing.T) {
 	bad := []string{
-		"dns://abc",                        // too short
-		"dns://" + strings.Repeat("a", 41), // too long
-		"dns://" + strings.Repeat("z", 40), // non-hex
-		"dns://" + strings.Repeat("g", 40), // non-hex
 		"",                                 // empty
+		"dns://",                           // empty target
+		"dns://not_a.repo",                 // underscore and dot
+		"dns://-lead",                      // leading hyphen
+		"dns://" + strings.Repeat("a", 64), // longer than a DNS label
+		"dns://a/b",                        // path
 	}
 	for _, in := range bad {
 		if _, err := parseURL(in); err == nil {
@@ -166,9 +186,9 @@ func TestNewHelperErrors(t *testing.T) {
 		t.Fatal("newHelper without zone: nil error, want error")
 	}
 
-	// Bad SHA -> parseURL error (zone is set again).
+	// Neither a SHA nor a repository name -> parseURL error (zone is set again).
 	t.Setenv("GIT_REMOTE_DNS_ZONE", "example.com")
-	if _, err := newHelper("dns://not-a-sha"); err == nil {
+	if _, err := newHelper("dns://not_a.repo"); err == nil {
 		t.Fatal("newHelper with bad URL: nil error, want error")
 	}
 }
@@ -182,7 +202,7 @@ func TestRunErrors(t *testing.T) {
 
 	// Invalid URL, zone set so loadConfig passes and parseURL fails.
 	t.Setenv("GIT_REMOTE_DNS_ZONE", "example.com")
-	if err := run([]string{"git-remote-dns", "origin", "dns://not-a-sha"}); err == nil {
+	if err := run([]string{"git-remote-dns", "origin", "dns://not_a.repo"}); err == nil {
 		t.Fatal("run with bad URL: nil error, want error")
 	}
 }
