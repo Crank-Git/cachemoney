@@ -18,10 +18,14 @@ doc/html/
 # Test / coverage
 coverage.txt
 coverage.html
+coverage.out
 
 # Local dev
 /.env
 *.local
+
+# Local runbooks
+/docs/live-dns-runbook.md
 
 # Editor / OS
 .DS_Store

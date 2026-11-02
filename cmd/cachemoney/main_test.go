@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -254,4 +255,29 @@ func TestParseTransport(t *testing.T) {
 	if _, err := parseTransport("nope"); err == nil {
 		t.Fatal("expected error for unknown transport")
 	}
+}
+
+// TestMain runs the compiled binary as a subprocess to cover the top-level
+// main() entry point, including the error print and non-zero exit path that
+// run() (invoked directly elsewhere) does not reach.
+func TestMain(t *testing.T) {
+	bin := buildBinary(t)
+	cmd := exec.Command(bin, "bogus-command")
+	if out, _ := cmd.CombinedOutput(); cmd.ProcessState.ExitCode() == 0 {
+		t.Fatalf("expected non-zero exit for unknown command, got %q", out)
+	}
+}
+
+// buildBinary compiles the cachemoney binary once for subprocess tests.
+func buildBinary(t *testing.T) string {
+	bin := filepath.Join(t.TempDir(), "cachemoney-bin")
+	args := []string{"build", "-o", bin, "."}
+	cmd := exec.Command("go", args...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("go build: %v\n%s", err, out)
+	}
+	if _, err := os.Stat(bin); err != nil {
+		t.Fatal(err)
+	}
+	return bin
 }

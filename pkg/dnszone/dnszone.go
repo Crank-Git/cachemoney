@@ -277,6 +277,27 @@ func (s *Server) Start(addr string) error {
 // handle answers a single query from the in-memory record map. Unknown names
 // yield NODATA (an empty answer), which a client treats as not-found.
 func (s *Server) handle(w dns.ResponseWriter, req *dns.Msg) {
+	m := s.answer(req)
+	// Truncate UDP answers to fit within the client's advertised UDP buffer so a
+	// response too large for a single UDP datagram is split with the TC bit set;
+	// the resolver uses TC to fall back to TCP (RFC 1035). Without truncation the
+	// oversized datagram is fragmented and dropped on the wire. TCP answers are
+	// length-prefixed and must never be truncated, so detect the network via the
+	// peer address (UDP -> *net.UDPAddr, TCP -> *net.TCPAddr).
+	if _, isTCP := w.RemoteAddr().(*net.TCPAddr); !isTCP {
+		if opt := req.IsEdns0(); opt != nil {
+			m.Truncate(int(opt.UDPSize()))
+		}
+	}
+	_ = w.WriteMsg(m)
+}
+
+// answer builds the response for req from the in-memory record map: each
+// question is matched against the stored records and any match is placed in the
+// answer section (NODATA when a name has no records). It holds the read lock and
+// never truncates or writes -- callers choose the framing (UDP truncation, TCP
+// length prefix, or a DoH body).
+func (s *Server) answer(req *dns.Msg) *dns.Msg {
 	m := new(dns.Msg)
 	m.SetReply(req)
 	m.Authoritative = true
@@ -289,10 +310,21 @@ func (s *Server) handle(w dns.ResponseWriter, req *dns.Msg) {
 			m.Answer = append(m.Answer, recs...)
 		}
 	}
-	_ = w.WriteMsg(m)
+	return m
 }
 
 // Shutdown stops the server and releases its ports.
+// CorruptAAAA flips a payload octet in the first AAAA record at fqdn so the
+// decoded content no longer matches its hash, letting tests exercise corruption
+// detection. It is intended for tests and panics if the record is missing or
+// not an AAAA record (publishers know the transport they used).
+func (s *Server) CorruptAAAA(fqdn string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rec := s.records[fqdn][0].(*dns.AAAA)
+	rec.AAAA[6] ^= 0x01
+}
+
 func (s *Server) Shutdown() {
 	if s.srv != nil {
 		_ = s.srv.Shutdown()

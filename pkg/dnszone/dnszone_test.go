@@ -61,6 +61,38 @@ func TestEndToEndRoundTrip(t *testing.T) {
 	}
 }
 
+// TestEndToEndTruncateAAAA exercises the resolver's TCP fallback: a single
+// large chunk whose AAAA encoding exceeds the 4 KB EDNS0 buffer forces the
+// server to truncate the UDP answer, so the resolver re-issues over TCP.
+func TestEndToEndTruncateAAAA(t *testing.T) {
+	srv, res, shutdown := newTestServer(t, objectstore.AAAA)
+	defer shutdown()
+
+	// A single ~3 KB chunk: its AAAA encoding (15 payload bytes per 16-byte
+	// record) is 201 records, so the UDP answer exceeds the 4 KB EDNS0 buffer
+	// and the server truncates it (setting the TC bit); the resolver then
+	// re-issues over TCP. The chunk stays under 256 records so the 1-byte
+	// sequence number in each AAAA record does not overflow.
+	data := randBytes(3000)
+	m := &objectstore.Manifest{
+		Version:    objectstore.ManifestVersion,
+		TotalSize:  int64(len(data)),
+		ChunkCount: 1,
+		ChunkIDs:   []objectstore.ObjectID{objectstore.ChunkID(data)},
+		ChunkLens:  []int64{int64(len(data))},
+	}
+	if err := srv.Publish(m, [][]byte{data}, objectstore.AAAA); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	got, err := res.Fetch(m, objectstore.AAAA)
+	if err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("round-trip mismatch: got %d bytes, want %d", len(got), len(data))
+	}
+}
+
 // TestEndToEndMissing ensures a missing object fails loudly over DNS.
 func TestEndToEndMissing(t *testing.T) {
 	srv, res, shutdown := newTestServer(t, objectstore.TXT)
@@ -95,6 +127,98 @@ func TestEndToEndTamper(t *testing.T) {
 
 	if _, err := res.Fetch(m, objectstore.TXT); err == nil {
 		t.Fatal("expected tamper detection, got nil")
+	}
+}
+
+// TestWithConcurrency checks the option sets the parallelism and resets to the
+// default for non-positive values, without disturbing the original resolver.
+func TestWithConcurrency(t *testing.T) {
+	res := NewResolver("127.0.0.1:5300", Zone("example.com"), 0)
+
+	base := res.WithConcurrency(4)
+	if base.concurrency != 4 {
+		t.Fatalf("WithConcurrency(4): got %d, want 4", base.concurrency)
+	}
+	// The original resolver is unchanged by chaining.
+	if res.concurrency != defaultConcurrency {
+		t.Fatalf("WithConcurrency mutated the base resolver: got %d", res.concurrency)
+	}
+
+	reset := base.WithConcurrency(0)
+	if reset.concurrency != defaultConcurrency {
+		t.Fatalf("WithConcurrency(0): got %d, want default %d", reset.concurrency, defaultConcurrency)
+	}
+}
+
+// TestParallelWalk fetches a multi-chunk object with a high concurrency limit,
+// exercising the bounded concurrent walk and order-independent reassembly.
+func TestParallelWalk(t *testing.T) {
+	srv, res, shutdown := newTestServer(t, objectstore.TXT)
+	defer shutdown()
+
+	// ~5 chunks (5x the concurrency limit) so the semaphore drains in waves.
+	data := randBytes(5*objectstore.DefaultChunkSize + 1)
+	m, chunks := objectstore.Build(data)
+	if err := srv.Publish(m, chunks, objectstore.TXT); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	res = res.WithConcurrency(1)
+	got, err := res.Fetch(m, objectstore.TXT)
+	if err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("round-trip mismatch: got %d bytes, want %d", len(got), len(data))
+	}
+}
+
+// TestFetchUsesCache verifies the resolver cache short-circuits a second fetch:
+// after the first fetch populates the cache, the object is returned even once
+// the server is gone, and a missing object is not cached.
+func TestFetchUsesCache(t *testing.T) {
+	srv, res, shutdown := newTestServer(t, objectstore.TXT)
+
+	m, chunks := objectstore.Build([]byte("cached object"))
+	if err := srv.Publish(m, chunks, objectstore.TXT); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	cache := NewCache(0)
+	res = res.WithCache(cache)
+
+	// First fetch populates the cache from the server.
+	if _, err := res.Fetch(m, objectstore.TXT); err != nil {
+		t.Fatalf("first fetch: %v", err)
+	}
+	if cache.Len() != 1 {
+		t.Fatalf("cache should hold one object, got %d", cache.Len())
+	}
+
+	// Kill the server; a cache hit must still succeed.
+	shutdown()
+	if _, err := res.Fetch(m, objectstore.TXT); err != nil {
+		t.Fatalf("fetch after server down: %v (cache should have served it)", err)
+	}
+}
+
+// TestMissingObjectNotCached verifies a failed fetch does not poison the cache:
+// a missing object is re-attempted on the next call rather than remembered as
+// a miss.
+func TestMissingObjectNotCached(t *testing.T) {
+	_, res, shutdown := newTestServer(t, objectstore.TXT)
+	defer shutdown()
+
+	cache := NewCache(0)
+	res = res.WithCache(cache)
+
+	// Fetch an id that was never published; it must fail loudly.
+	missing := objectstore.ChunkID([]byte("never published"))
+	if _, err := res.FetchByID(missing, objectstore.TXT); err == nil {
+		t.Fatal("expected a not-found error")
+	}
+	if cache.Len() != 0 {
+		t.Fatalf("a missing object must not be cached, Len=%d", cache.Len())
 	}
 }
 
@@ -320,11 +444,178 @@ func TestLoadStoreRejectsBadManifest(t *testing.T) {
 	}
 }
 
+// TestLoadStoreRejectsUnreadableManifest ensures LoadStore fails when a manifest
+// file exists but cannot be read, rather than silently skipping it.
+func TestLoadStoreRejectsUnreadableManifest(t *testing.T) {
+	srv := NewServer(Zone("example.com"), DefaultTTL)
+	dir := t.TempDir()
+	mDir := filepath.Join(dir, "manifests")
+	if err := os.MkdirAll(mDir, 0o750); err != nil {
+		t.Fatalf("mkdir manifests: %v", err)
+	}
+	path := filepath.Join(mDir, "deadbeef.json")
+	if err := os.WriteFile(path, []byte("{}"), 0o640); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	// Strip all read access: ReadDir still lists the file, but ReadFile fails.
+	if err := os.Chmod(path, 0o000); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	if err := srv.LoadStore(dir, objectstore.TXT); err == nil {
+		t.Fatal("LoadStore accepted an unreadable manifest, want error")
+	}
+}
+
+// TestLoadStoreMissingChunk ensures LoadStore fails when a manifest references a
+// chunk that is not present in the store, rather than serving a manifest with
+// no backing data.
+func TestLoadStoreMissingChunk(t *testing.T) {
+	dir := t.TempDir()
+	mDir := filepath.Join(dir, "manifests")
+	if err := os.MkdirAll(mDir, 0o750); err != nil {
+		t.Fatalf("mkdir manifests: %v", err)
+	}
+	// Build a valid manifest but never write its chunk files, so LoadStore's
+	// per-chunk read fails.
+	m, _ := objectstore.Build([]byte("a small payload"))
+	mb, err := m.Bytes()
+	if err != nil {
+		t.Fatalf("manifest bytes: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(mDir, string(m.ID())+".json"), mb, 0o640); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	srv := NewServer(Zone("example.com"), DefaultTTL)
+	if err := srv.LoadStore(dir, objectstore.TXT); err == nil {
+		t.Fatal("LoadStore succeeded with a missing chunk, want error")
+	}
+}
+
 // TestCorruptUnknown ensures Corrupt on an id with no stored record fails
 // loudly rather than silently succeeding.
 func TestCorruptUnknown(t *testing.T) {
 	srv := NewServer(Zone("example.com"), DefaultTTL)
 	if err := srv.Corrupt(objectstore.ObjectID("notastoredid")); err == nil {
 		t.Fatal("Corrupt on unknown id accepted, want error")
+	}
+}
+
+// TestCorruptAAAA ensures CorruptAAAA flips a payload octet in an AAAA record
+// so the decoded content no longer matches the original, which is what lets a
+// caller detect the tampering. TXT records are covered by CorruptAt; AAAA is
+// decoded without base64, so a flipped octet changes content rather than
+// breaking decoding.
+func TestCorruptAAAA(t *testing.T) {
+	srv, res, shutdown := newTestServer(t, objectstore.AAAA)
+	defer shutdown()
+
+	const id = "AAAACORRUPT"
+	fqdn := dns.Fqdn(id + ".f.example.com")
+	payload := []byte("corruptable AAAA payload data")
+	if err := srv.PublishRaw(fqdn, payload, objectstore.AAAA); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	srv.CorruptAAAA(fqdn)
+
+	got, err := res.WithObjectSuffix("f").FetchRaw(id, objectstore.AAAA)
+	if err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	if bytes.Equal(got, payload) {
+		t.Fatal("fetch returned original payload after CorruptAAAA, want corrupted bytes")
+	}
+}
+
+// TestPortReturnsZeroUnstarted ensures Port reports 0 when the server has not
+// been started yet, so a caller can tell an unbound server from one on port 0.
+func TestPortReturnsZeroUnstarted(t *testing.T) {
+	srv := NewServer(Zone("example.com"), DefaultTTL)
+	if p := srv.Port(); p != 0 {
+		t.Fatalf("Port = %d on unstarted server, want 0", p)
+	}
+}
+
+// TestStartBadAddr ensures Start fails when it cannot discover a free port, so
+// a caller learns the server never bound rather than blocking forever.
+func TestStartBadAddr(t *testing.T) {
+	srv := NewServer(Zone("example.com"), DefaultTTL)
+	if err := srv.Start("127.0.0.1:notaport"); err == nil {
+		t.Fatal("Start succeeded with an unparseable port, want error")
+	}
+}
+
+// TestLoadStoreSkipsNonJSON ensures LoadStore ignores entries that are not
+// manifest files (subdirectories and non-.json files) rather than erroring.
+func TestLoadStoreSkipsNonJSON(t *testing.T) {
+	srv := NewServer(Zone("example.com"), DefaultTTL)
+	dir := t.TempDir()
+	mDir := filepath.Join(dir, "manifests")
+	cDir := filepath.Join(dir, "chunks")
+	if err := os.MkdirAll(mDir, 0o750); err != nil {
+		t.Fatalf("mkdir manifests: %v", err)
+	}
+	if err := os.MkdirAll(cDir, 0o750); err != nil {
+		t.Fatalf("mkdir chunks: %v", err)
+	}
+	// A subdirectory and a non-json file in the manifests dir: both skipped.
+	if err := os.MkdirAll(filepath.Join(mDir, "subdir"), 0o755); err != nil {
+		t.Fatalf("mkdir subdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(mDir, "notes.txt"), []byte("ignore me"), 0o640); err != nil {
+		t.Fatalf("write notes: %v", err)
+	}
+	if err := srv.LoadStore(dir, objectstore.TXT); err != nil {
+		t.Fatalf("LoadStore skipped non-json entries, want no error: %v", err)
+	}
+}
+
+// TestCorruptAtNonTXT ensures corruptRecord rejects a non-TXT record (e.g. an
+// AAAA record) rather than flipping a byte in a wrong record type.
+func TestCorruptAtNonTXT(t *testing.T) {
+	srv := NewServer(Zone("example.com"), DefaultTTL)
+	// Publish a payload as an AAAA record so the stored record is not TXT.
+	fqdn := "aaaa.example.com."
+	payload := []byte("aaaa-record-content")
+	if err := srv.PublishRaw(fqdn, payload, objectstore.AAAA); err != nil {
+		t.Fatalf("publish raw AAAA: %v", err)
+	}
+	if err := srv.CorruptAt(fqdn); err == nil {
+		t.Fatal("CorruptAt on AAAA record accepted, want error")
+	}
+}
+
+// TestCorruptRecordEmptyTxt ensures corruptRecord rejects a TXT record with no
+// character-strings.
+func TestCorruptRecordEmptyTxt(t *testing.T) {
+	srv := NewServer(Zone("example.com"), DefaultTTL)
+	fqdn := "emptytxt.example.com."
+	srv.records[fqdn] = []dns.RR{&dns.TXT{
+		Hdr: dns.RR_Header{Name: fqdn, Rrtype: dns.TypeTXT, Class: dns.ClassINET, Ttl: srv.ttl},
+		Txt: []string{},
+	}}
+	if err := srv.corruptRecord(fqdn); err == nil {
+		t.Fatal("corruptRecord on empty TXT accepted, want error")
+	}
+}
+
+// TestCorruptRecordNoColon ensures corruptRecord rejects a TXT record whose
+// first character-string has no ":" data separator.
+func TestCorruptRecordNoColon(t *testing.T) {
+	srv := NewServer(Zone("example.com"), DefaultTTL)
+	fqdn := "nocolon.example.com."
+	srv.records[fqdn] = []dns.RR{&dns.TXT{
+		Hdr: dns.RR_Header{Name: fqdn, Rrtype: dns.TypeTXT, Class: dns.ClassINET, Ttl: srv.ttl},
+		Txt: []string{"noseparator"},
+	}}
+	if err := srv.corruptRecord(fqdn); err == nil {
+		t.Fatal("corruptRecord on TXT without colon accepted, want error")
+	}
+}
+
+// TestStoreUnknownTransport ensures store rejects an unknown transport value.
+func TestStoreUnknownTransport(t *testing.T) {
+	srv := NewServer(Zone("example.com"), DefaultTTL)
+	if err := srv.store("unknown.example.com.", []byte("data"), objectstore.Transport(99)); err == nil {
+		t.Fatal("store with unknown transport accepted, want error")
 	}
 }

@@ -277,3 +277,111 @@ func TestWalkDetectsMissingParent(t *testing.T) {
 		t.Fatal("expected error for missing parent")
 	}
 }
+
+// TestParseTreeMalformed ensures ParseTree rejects structurally broken tree
+// bytes: a missing mode separator, a missing name terminator, and a truncated
+// SHA. Each malformed input is a distinct branch that a well-formed tree never
+// exercises.
+func TestParseTreeMalformed(t *testing.T) {
+	// No space separating mode from name.
+	if _, err := ParseTree([]byte("100644a.txt" + refHello)); err == nil {
+		t.Fatal("expected no-mode-separator error")
+	}
+	// Space present, but no NUL terminating the name.
+	if _, err := ParseTree([]byte("100644 a.txt" + refHello)); err == nil {
+		t.Fatal("expected no-name-terminator error")
+	}
+	// Valid mode and name, but fewer than 20 bytes of SHA.
+	if _, err := ParseTree([]byte("100644 a.txt" + refHello[:10])); err == nil {
+		t.Fatal("expected truncated-SHA error")
+	}
+}
+
+// TestParseCommitNoSeparator covers the branch where a commit has no blank
+// line separating header from message: the whole body is treated as the
+// header and the message is empty, so field parsing still runs.
+func TestParseCommitNoSeparator(t *testing.T) {
+	content := []byte("tree " + refTree2 + "\nauthor A <a@example.com> 1700000000 +0000")
+	raw := rawBytes(Commit, content)
+	o, err := ReadObject(raw)
+	if err != nil {
+		t.Fatalf("ReadObject: %v", err)
+	}
+	if o.Message != "" {
+		t.Errorf("message = %q, want empty", o.Message)
+	}
+	if o.Tree != refTree2 {
+		t.Errorf("tree = %q, want %q", o.Tree, refTree2)
+	}
+}
+
+// TestParseCommitMalformedHeader ensures a header line without a key/value
+// separator is rejected.
+func TestParseCommitMalformedHeader(t *testing.T) {
+	content := []byte("this-line-has-no-separator\n")
+	raw := rawBytes(Commit, content)
+	if _, err := ReadObject(raw); err == nil {
+		t.Fatal("expected malformed commit header error")
+	}
+}
+
+// TestReadObjectRejectsMalformedHeader covers the malformed-header and
+// bad-size branches of ReadObject.
+func TestReadObjectRejectsMalformedHeader(t *testing.T) {
+	// Header with no space: kind/size cannot be split.
+	badNoSpace := append([]byte("garbage"), 0, 'h', 'i')
+	if _, err := ReadObject(badNoSpace); err == nil {
+		t.Fatal("expected malformed header error")
+	}
+	// Header with a non-numeric size.
+	badSize := append([]byte("blob notanumber"), 0, 'h', 'i')
+	if _, err := ReadObject(badSize); err == nil {
+		t.Fatal("expected bad size error")
+	}
+}
+
+// TestReadObjectRejectsMalformedContent covers the branches where ReadObject
+// parses a tree or commit whose content is itself malformed.
+func TestReadObjectRejectsMalformedContent(t *testing.T) {
+	// A tree object whose content has no mode separator.
+	malformedTree := rawBytes(Tree, []byte("no-separator-here"))
+	if _, err := ReadObject(malformedTree); err == nil {
+		t.Fatal("expected malformed tree content error")
+	}
+	// A commit object whose header line has no separator.
+	malformedCommit := rawBytes(Commit, []byte("brokenline"))
+	if _, err := ReadObject(malformedCommit); err == nil {
+		t.Fatal("expected malformed commit content error")
+	}
+}
+
+// TestWalkFetchError covers the branch where the fetch function returns an
+// error for a referenced object.
+func TestWalkFetchError(t *testing.T) {
+	commit := []byte("tree " + refTree2 + "\nauthor A <a@example.com> 1700000000 +0000\ncommitter A <a@example.com> 1700000000 +0000\n\nroot\n")
+	commitSHA := ObjectSHA(Commit, commit)
+
+	fetch := func(sha string) ([]byte, error) {
+		if sha == refTree2 {
+			return nil, fmt.Errorf("boom")
+		}
+		return rawBytes(Commit, commit), nil
+	}
+
+	if _, err := Walk(fetch, commitSHA); err == nil {
+		t.Fatal("expected fetch error")
+	}
+}
+
+// TestParseTreeTruncatedSHA ensures a tree entry with fewer than 20 bytes of
+// SHA is rejected, so a truncated tree fails loudly rather than reading
+// past its own data.
+func TestParseTreeTruncatedSHA(t *testing.T) {
+	raw := []byte("100644 a.txt")[:0]
+	raw = append(raw, []byte("100644 a.txt")...)
+	raw = append(raw, 0)
+	raw = append(raw, 0x01, 0x02, 0x03) // only 3 of the 20 SHA bytes
+	if _, err := ParseTree(raw); err == nil {
+		t.Fatal("truncated SHA accepted, want error")
+	}
+}
