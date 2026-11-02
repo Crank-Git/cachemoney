@@ -292,3 +292,33 @@ func TestFetchAcceptsLowercaseIndexLabel(t *testing.T) {
 		}
 	}
 }
+
+// TestFetchWithAnyResolverSuffix fetches through resolvers configured for the
+// default manifest scheme and for the git scheme. Fetch used to look the file
+// up under the caller's suffix (<hash>.o.<zone>) and fail with "record not
+// found" unless the caller had already selected the mirror scheme.
+func TestFetchWithAnyResolverSuffix(t *testing.T) {
+	for _, tr := range []objectstore.Transport{objectstore.TXT, objectstore.AAAA} {
+		t.Run("transport="+strconv.Itoa(int(tr)), func(t *testing.T) {
+			idx, files := testIndex()
+			srv, _, shutdown := startServer(t)
+			defer shutdown()
+			label, err := Publish(srv, idx, files, tr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			base := dnszone.NewResolver("127.0.0.1:"+strconv.Itoa(srv.Port()), dnszone.Zone("example.com"), 0)
+			for name, r := range map[string]*dnszone.Resolver{"default": base, "git": base.WithObjectSuffix("g")} {
+				for path, want := range files {
+					got, err := Fetch(r, label, path, tr)
+					if err != nil {
+						t.Fatalf("%s resolver, fetch %s: %v", name, path, err)
+					}
+					if !bytes.Equal(got, want) {
+						t.Fatalf("%s resolver, fetch %s: got %q, want %q", name, path, got, want)
+					}
+				}
+			}
+		})
+	}
+}

@@ -75,8 +75,12 @@ func Publish(s *dnszone.Server, idx *pkgindex.Index, files map[string][]byte, tr
 // fetches the matching file record, and verifies the file's size and sha256
 // against the index. It returns the file's bytes. A missing index, unknown
 // path, or tampered file fails loudly rather than returning unverified data.
+//
+// Both records live under the mirror's "f" scheme, so r may be any resolver for
+// the zone; its own object suffix is ignored.
 func Fetch(r *dnszone.Resolver, indexHash, path string, tr objectstore.Transport) ([]byte, error) {
-	idxRaw, err := resolverSuffix(r).FetchRaw(indexHash, tr)
+	r = resolverSuffix(r)
+	idxRaw, err := r.FetchRaw(indexHash, tr)
 	if err != nil {
 		return nil, fmt.Errorf("mirror: fetch index %s: %w", indexHash, err)
 	}
