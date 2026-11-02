@@ -41,7 +41,7 @@ func TestResolveManifestRejectsTamper(t *testing.T) {
 			fqdn := dns.Fqdn(srv.manifestName(m.ID()))
 			if tr == objectstore.AAAA {
 				srv.mu.Lock()
-				recs := srv.records[fqdn]
+				recs := srv.records[nameKey(fqdn)]
 				addr := recs[0].(*dns.AAAA)
 				// Byte 0 is the sequence number; flip a payload byte instead.
 				addr.AAAA[1] ^= 0x01

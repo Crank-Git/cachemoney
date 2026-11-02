@@ -32,8 +32,8 @@ type Zone string
 const DefaultTTL uint32 = 300
 
 // Server is a minimal authoritative DNS server for one zone. It holds records
-// in memory, keyed by fully-qualified name, and answers every query from that
-// map. It exists to demonstrate the end-to-end path; a production server would
+// in memory, keyed by lowercased fully-qualified name (DNS names are
+// case-insensitive, RFC 4343), and answers every query from that map. It exists to demonstrate the end-to-end path; a production server would
 // load records from disk or a backend.
 type Server struct {
 	zone    Zone
@@ -179,7 +179,7 @@ func (s *Server) Corrupt(id objectstore.ObjectID) error {
 func (s *Server) Forget(fqdn string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.records, fqdn)
+	delete(s.records, nameKey(fqdn))
 }
 
 // CorruptAt flips a byte in the first TXT piece of the record stored under the
@@ -198,7 +198,7 @@ func (s *Server) CorruptAt(fqdn string) error {
 // sequence prefix, so the decoded bytes change and the content hash no longer
 // matches the object.
 func (s *Server) corruptRecord(fqdn string) error {
-	recs, ok := s.records[fqdn]
+	recs, ok := s.records[nameKey(fqdn)]
 	if !ok {
 		return fmt.Errorf("no record for %s", fqdn)
 	}
@@ -226,7 +226,7 @@ func (s *Server) store(fqdn string, payload []byte, tr objectstore.Transport) er
 	switch tr {
 	case objectstore.TXT:
 		pieces := objectstore.EncodeTXT(objectstore.Frame{Payload: payload})
-		s.records[fqdn] = []dns.RR{&dns.TXT{
+		s.records[nameKey(fqdn)] = []dns.RR{&dns.TXT{
 			Hdr: dns.RR_Header{Name: fqdn, Rrtype: dns.TypeTXT, Class: dns.ClassINET, Ttl: s.ttl},
 			Txt: pieces,
 		}}
@@ -239,7 +239,7 @@ func (s *Server) store(fqdn string, payload []byte, tr objectstore.Transport) er
 				AAAA: net.IP(a),
 			})
 		}
-		s.records[fqdn] = rrs
+		s.records[nameKey(fqdn)] = rrs
 	default:
 		return fmt.Errorf("objectstore: unknown transport %d", tr)
 	}
@@ -310,12 +310,26 @@ func (s *Server) answer(req *dns.Msg) *dns.Msg {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	for _, q := range req.Question {
-		if recs, ok := s.records[q.Name]; ok {
-			m.Answer = append(m.Answer, recs...)
+		recs, ok := s.records[nameKey(q.Name)]
+		if !ok {
+			continue
+		}
+		// Answer with the owner name spelled exactly as asked. Resolvers
+		// that randomize query case (DNS 0x20) match the response against
+		// the case they sent, so the stored spelling must not leak through.
+		for _, rr := range recs {
+			c := dns.Copy(rr)
+			c.Header().Name = q.Name
+			m.Answer = append(m.Answer, c)
 		}
 	}
 	return m
 }
+
+// nameKey is the record-map key for a name: DNS names compare
+// case-insensitively (RFC 4343), so every lookup and store goes through the
+// lowercased form.
+func nameKey(name string) string { return strings.ToLower(name) }
 
 // Shutdown stops the server and releases its ports.
 // CorruptAAAA flips a payload octet in the first AAAA record at fqdn so the
@@ -325,7 +339,7 @@ func (s *Server) answer(req *dns.Msg) *dns.Msg {
 func (s *Server) CorruptAAAA(fqdn string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rec := s.records[fqdn][0].(*dns.AAAA)
+	rec := s.records[nameKey(fqdn)][0].(*dns.AAAA)
 	rec.AAAA[6] ^= 0x01
 }
 

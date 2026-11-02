@@ -15,6 +15,7 @@ package mirror
 import (
 	"crypto/sha256"
 	"fmt"
+	"strings"
 
 	"github.com/miekg/dns"
 
@@ -82,7 +83,7 @@ func Fetch(r *dnszone.Resolver, indexHash, path string, tr objectstore.Transport
 	// The index is content-addressed by indexHash: verify the fetched bytes
 	// actually hash to it. Without this a tampered index that did not touch the
 	// requested file would be used as-is.
-	if got := objectstore.ToLabel(sha256.Sum256(idxRaw)); got != indexHash {
+	if got := objectstore.ToLabel(sha256.Sum256(idxRaw)); !strings.EqualFold(got, indexHash) {
 		return nil, fmt.Errorf("mirror: index %s content mismatch: got %s", indexHash, got)
 	}
 	idx, err := pkgindex.ParseIndex(idxRaw)

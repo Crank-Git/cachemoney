@@ -589,7 +589,7 @@ func TestCorruptAtNonTXT(t *testing.T) {
 func TestCorruptRecordEmptyTxt(t *testing.T) {
 	srv := NewServer(Zone("example.com"), DefaultTTL)
 	fqdn := "emptytxt.example.com."
-	srv.records[fqdn] = []dns.RR{&dns.TXT{
+	srv.records[nameKey(fqdn)] = []dns.RR{&dns.TXT{
 		Hdr: dns.RR_Header{Name: fqdn, Rrtype: dns.TypeTXT, Class: dns.ClassINET, Ttl: srv.ttl},
 		Txt: []string{},
 	}}
@@ -603,7 +603,7 @@ func TestCorruptRecordEmptyTxt(t *testing.T) {
 func TestCorruptRecordNoColon(t *testing.T) {
 	srv := NewServer(Zone("example.com"), DefaultTTL)
 	fqdn := "nocolon.example.com."
-	srv.records[fqdn] = []dns.RR{&dns.TXT{
+	srv.records[nameKey(fqdn)] = []dns.RR{&dns.TXT{
 		Hdr: dns.RR_Header{Name: fqdn, Rrtype: dns.TypeTXT, Class: dns.ClassINET, Ttl: srv.ttl},
 		Txt: []string{"noseparator"},
 	}}

@@ -51,8 +51,9 @@ const (
 	AAAA
 )
 
-// b32 is lowercase, unpadded base32 (RFC 4648). A SHA-256 hash -> ~51 chars,
-// which fits inside the 63-char DNS label limit (hex would be 64).
+// b32 is unpadded base32 (RFC 4648, uppercase alphabet). A SHA-256 hash ->
+// 52 chars, which fits inside the 63-char DNS label limit (hex would be 64).
+// DNS compares names case-insensitively, so a label may arrive in any case.
 var b32 = base32.StdEncoding.WithPadding(base32.NoPadding)
 
 // ObjectID is a base32 label: the identity of a chunk, manifest, or object.
