@@ -23,7 +23,14 @@ import (
 // .git/objects store. The graph is walked and SHA-1 verified with gitobj.Walk,
 // so a corrupt source object is rejected before it is published.
 func Publish(s *dnszone.Server, commitSHA string, fetch func(sha string) ([]byte, error), tr objectstore.Transport) error {
-	objects, err := gitobj.Walk(fetch, commitSHA)
+	return PublishAll(s, []string{commitSHA}, fetch, tr)
+}
+
+// PublishAll is Publish for several roots (each a commit or annotated tag),
+// walked in one pass so history shared between them is read and published
+// once. fetch is called one object at a time.
+func PublishAll(s *dnszone.Server, roots []string, fetch func(sha string) ([]byte, error), tr objectstore.Transport) error {
+	objects, err := gitobj.WalkAll(fetch, roots, 1, nil)
 	if err != nil {
 		return err
 	}
@@ -44,7 +51,15 @@ func Publish(s *dnszone.Server, commitSHA string, fetch func(sha string) ([]byte
 // another. It returns every object encountered, keyed by SHA. The resolver
 // must be configured for the git scheme (see dnszone.Resolver.WithObjectSuffix).
 func Fetch(r *dnszone.Resolver, commitSHA string, tr objectstore.Transport) (map[string]*gitobj.Object, error) {
-	return gitobj.WalkConcurrent(func(sha string) ([]byte, error) {
+	return FetchAll(r, []string{commitSHA}, tr, nil)
+}
+
+// FetchAll is Fetch for several roots (commits or annotated tags) in one
+// walk. When have is non-nil, objects it reports present locally are not
+// fetched, nor is anything below them (see gitobj.WalkAll), so an incremental
+// fetch only downloads what is new.
+func FetchAll(r *dnszone.Resolver, roots []string, tr objectstore.Transport, have func(sha string) bool) (map[string]*gitobj.Object, error) {
+	return gitobj.WalkAll(func(sha string) ([]byte, error) {
 		return r.FetchRaw(sha, tr)
-	}, commitSHA, r.Concurrency())
+	}, roots, r.Concurrency(), have)
 }

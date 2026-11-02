@@ -367,3 +367,76 @@ func TestFetchOverlapsObjectQueries(t *testing.T) {
 		t.Fatalf("peak concurrent queries %d; Fetch is not overlapping object fetches", p)
 	}
 }
+
+// TestPublishAllFetchAllWithTagsAndHave publishes two branches and an
+// annotated tag in one pass, fetches them all over DNS, then fetches again as
+// a client that already has the first branch: only the second branch's new
+// objects come over the wire.
+func TestPublishAllFetchAllWithTagsAndHave(t *testing.T) {
+	for _, tr := range []objectstore.Transport{objectstore.TXT, objectstore.AAAA} {
+		t.Run("transport="+strconv.Itoa(int(tr)), func(t *testing.T) {
+			objects := map[string][]byte{}
+			put := func(kind gitobj.Kind, content string) string {
+				sha := gitobj.ObjectSHA(kind, []byte(content))
+				objects[sha] = rawBytes(kind, []byte(content))
+				return sha
+			}
+			commit := func(file, msg string, parents ...string) string {
+				blob := put(gitobj.Blob, file)
+				tree := put(gitobj.Tree, string(gitobj.MarshalTree([]gitobj.Entry{{Mode: "100644", Name: "f", SHA: blob}})))
+				c := "tree " + tree + "\n"
+				for _, p := range parents {
+					c += "parent " + p + "\n"
+				}
+				return put(gitobj.Commit, c+"author A <a@x> 0 +0000\ncommitter A <a@x> 0 +0000\n\n"+msg+"\n")
+			}
+			main := commit("main\n", "main")
+			dev := commit("dev\n", "dev", main)
+			tag := put(gitobj.Tag, "object "+main+"\ntype commit\ntag v1\ntagger A <a@x> 0 +0000\n\nv1\n")
+
+			srv := dnszone.NewServer(dnszone.Zone("example.com"), 0)
+			if err := srv.Start("127.0.0.1:0"); err != nil {
+				t.Fatal(err)
+			}
+			defer srv.Shutdown()
+			calls := map[string]int{}
+			if err := PublishAll(srv, []string{main, dev, tag}, func(sha string) ([]byte, error) {
+				calls[sha]++
+				return objects[sha], nil
+			}, tr); err != nil {
+				t.Fatal(err)
+			}
+			for sha, n := range calls {
+				if n != 1 {
+					t.Fatalf("PublishAll read %s %d times", sha, n)
+				}
+			}
+
+			r := dnszone.NewResolver("127.0.0.1:"+strconv.Itoa(srv.Port()), dnszone.Zone("example.com"), 0).WithObjectSuffix("g")
+			all, err := FetchAll(r, []string{dev, tag}, tr, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(all) != len(objects) {
+				t.Fatalf("FetchAll got %d objects, want %d", len(all), len(objects))
+			}
+
+			have, err := FetchAll(r, []string{main}, tr, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			fresh, err := FetchAll(r, []string{dev, tag}, tr, func(sha string) bool { _, ok := have[sha]; return ok })
+			if err != nil {
+				t.Fatal(err)
+			}
+			for sha := range fresh {
+				if _, dup := have[sha]; dup {
+					t.Fatalf("re-fetched %s the client already had", sha)
+				}
+			}
+			if len(fresh) != 4 { // dev commit, its tree, its blob, the tag
+				t.Fatalf("incremental fetch got %d objects, want 4", len(fresh))
+			}
+		})
+	}
+}

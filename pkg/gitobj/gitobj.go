@@ -63,6 +63,9 @@ type Object struct {
 	Author    string
 	Committer string
 	Message   string
+
+	// Tag fields: the object an annotated tag points at.
+	Target string
 }
 
 // ObjectSHA returns the hex SHA-1 of the canonical Git object bytes for the
@@ -179,6 +182,24 @@ func ParseCommit(raw []byte) (*Object, error) {
 	return o, nil
 }
 
+// ParseTag parses canonical Git tag bytes and returns the SHA of the object
+// the tag points at (its "object" header).
+func ParseTag(raw []byte) (string, error) {
+	header := string(raw)
+	if i := strings.Index(header, "\n\n"); i >= 0 {
+		header = header[:i]
+	}
+	for _, line := range strings.Split(header, "\n") {
+		if target, ok := strings.CutPrefix(line, "object "); ok {
+			if len(target) != 40 || len(hexDec(target)) != 20 {
+				return "", fmt.Errorf("gitobj: tag object %q is not a SHA-1", target)
+			}
+			return target, nil
+		}
+	}
+	return "", fmt.Errorf("gitobj: tag has no object header")
+}
+
 // ReadObject inspects the raw bytes of a Git object, verifies its content
 // length, computes and returns its SHA-1, and parses the kind-specific fields.
 // The header must be canonical ("<kind> <decimal size>\x00" with a known kind
@@ -224,6 +245,10 @@ func ReadObject(raw []byte) (*Object, error) {
 			return nil, err
 		}
 		o.Tree, o.Parents, o.Author, o.Committer, o.Message = c.Tree, c.Parents, c.Author, c.Committer, c.Message
+	case Tag:
+		if o.Target, err = ParseTag(content); err != nil {
+			return nil, err
+		}
 	}
 	return o, nil
 }
@@ -242,6 +267,19 @@ func Walk(fetch func(sha string) ([]byte, error), commitSHA string) (map[string]
 // must be safe for concurrent use when workers > 1. On the first error no new
 // fetches start, in-flight ones are drained, and that error is returned.
 func WalkConcurrent(fetch func(sha string) ([]byte, error), commitSHA string, workers int) (map[string]*Object, error) {
+	return WalkAll(fetch, []string{commitSHA}, workers, nil)
+}
+
+// WalkAll walks from every root in one pass (a ref's commit or annotated
+// tag), fetching each reachable object once with up to workers in flight.
+// Annotated tags are followed to the object they point at.
+//
+// When have is non-nil it is asked about each object before it is fetched;
+// an object it reports present is skipped along with everything below it, on
+// git's guarantee that a repository holding an object holds its closure. It
+// is called from one goroutine at a time. The result holds only the objects
+// fetched.
+func WalkAll(fetch func(sha string) ([]byte, error), roots []string, workers int, have func(sha string) bool) (map[string]*Object, error) {
 	if workers < 1 {
 		workers = 1
 	}
@@ -265,13 +303,20 @@ func WalkConcurrent(fetch func(sha string) ([]byte, error), commitSHA string, wo
 	}
 
 	objects := make(map[string]*Object)
-	queued := map[string]bool{commitSHA: true}
-	pending := []string{commitSHA}
+	queued := map[string]bool{}
+	var pending []string
 	enqueue := func(sha string) {
-		if !queued[sha] {
-			queued[sha] = true
-			pending = append(pending, sha)
+		if queued[sha] {
+			return
 		}
+		queued[sha] = true
+		if have != nil && have(sha) {
+			return
+		}
+		pending = append(pending, sha)
+	}
+	for i := len(roots) - 1; i >= 0; i-- {
+		enqueue(roots[i])
 	}
 	inflight := 0
 	var firstErr error
@@ -311,6 +356,8 @@ func WalkConcurrent(fetch func(sha string) ([]byte, error), commitSHA string, wo
 			for _, p := range o.Parents {
 				enqueue(p)
 			}
+		case Tag:
+			enqueue(o.Target)
 		}
 	}
 	if firstErr != nil {
