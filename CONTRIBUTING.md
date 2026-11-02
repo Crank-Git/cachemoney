@@ -37,7 +37,10 @@ This repo uses a two-branch integration model with pull requests on every path.
    # then https://github.com/Crank-Git/cachemoney/pull/new/<feature-name>
    ```
 5. Once the PR is merged into `dev`, open a second PR **from `dev` into `main`**
-   (squash-merge) to promote the change to stable.
+   and merge it with a **merge commit** (not squash) to promote the change to
+   stable. A merge commit keeps `main` an ancestor of `dev`, so the next
+   promotion only lists new commits; a squash would make `dev`'s history look
+   unmerged every time.
 
 ## Branch protection
 

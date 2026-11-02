@@ -150,7 +150,7 @@ feature ──► dev ──► main
 ```
 
 - Feature branches fork off `dev`.
-- PR #1: feature → `dev`. PR #2: `dev` → `main` (squash).
+- PR #1: feature → `dev`. PR #2: `dev` → `main` (merge commit).
 - Both `dev` and `main` are protected: PR required, CI must pass, admins cannot
   bypass.
 
