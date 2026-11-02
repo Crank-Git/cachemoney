@@ -31,6 +31,10 @@ const (
 	Commit Kind = "commit"
 )
 
+// GitlinkMode is the tree-entry mode of a gitlink: a submodule pointer whose
+// SHA names a commit in another repository.
+const GitlinkMode = "160000"
+
 // Entry is one tree entry: a mode, a name, and the SHA of the object it
 // references.
 type Entry struct {
@@ -211,7 +215,8 @@ func ReadObject(raw []byte) (*Object, error) {
 }
 
 // Walk fetches the commit at commitSHA and every object it references,
-// verifying each object's SHA-1 as it is fetched. fetch retrieves the raw
+// verifying each object's SHA-1 as it is fetched. Gitlink (submodule) entries
+// are not followed: their commits live in another repository. fetch retrieves the raw
 // (uncompressed) bytes of a Git object by its hex SHA-1. It returns every
 // object encountered, keyed by SHA.
 func Walk(fetch func(sha string) ([]byte, error), commitSHA string) (map[string]*Object, error) {
@@ -239,6 +244,11 @@ func Walk(fetch func(sha string) ([]byte, error), commitSHA string) (map[string]
 		switch o.Kind {
 		case Tree:
 			for _, e := range o.Entries {
+				// A gitlink names a commit in another repository (a
+				// submodule); it is not part of this graph.
+				if e.Mode == GitlinkMode {
+					continue
+				}
 				if _, seen := objects[e.SHA]; !seen {
 					stack = append(stack, e.SHA)
 				}
