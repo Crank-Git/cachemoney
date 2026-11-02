@@ -1,0 +1,33 @@
+# Binaries
+/dist/
+/cachemoney
+/cachemoney.exe
+*.test
+*.out
+
+# Go
+/vendor/
+*.exe
+*.exe.dll
+*.dll
+*.so
+*.dylib
+doc/html/
+*.pc
+
+# Test / coverage
+coverage.txt
+coverage.html
+coverage.out
+
+# Local dev
+/.env
+*.local
+
+# Local runbooks
+/docs/live-dns-runbook.md
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/

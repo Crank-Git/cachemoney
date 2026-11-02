@@ -1,0 +1,49 @@
+name: test
+
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+    branches: [dev, main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.27'
+
+      - name: Build
+        run: go build ./...
+
+      - name: Format (gofmt)
+        run: test -z "$(gofmt -l $(find . -name '*.go' -not -path './vendor/*'))" && echo "gofmt clean"
+
+      - name: Install unbound (recursive resolver integration test)
+        run: |
+          # Keep apt from starting the system unbound service (it would fight
+          # systemd-resolved for port 53); the test runs its own instance.
+          printf '#!/bin/sh\nexit 101\n' | sudo tee /usr/sbin/policy-rc.d >/dev/null
+          sudo chmod +x /usr/sbin/policy-rc.d
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends unbound
+          # The packaged AppArmor profile only allows configs under /etc.
+          sudo apparmor_parser -R /etc/apparmor.d/usr.sbin.unbound 2>/dev/null || true
+
+      - name: Test
+        env:
+          CACHEMONEY_REQUIRE_UNBOUND: "1"
+        run: go test -race -coverprofile=coverage.out ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Coverage gate
+        run: |
+          total=$(go tool cover -func=coverage.out | tail -n 1 | awk '{split($3,a,"%"); print a[1]}')
+          echo "total coverage: ${total}%"
+          awk -v t="$total" 'BEGIN{ if (t+0 < 70) { print "coverage below 70%"; exit 1 } }'
