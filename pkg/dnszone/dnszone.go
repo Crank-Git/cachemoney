@@ -138,7 +138,7 @@ func (s *Server) Port() int {
 // given transport for every record. A manifest too large for one record is
 // stored indirectly (objectstore.IndirectManifest).
 func (s *Server) Publish(m *objectstore.Manifest, chunks [][]byte, tr objectstore.Transport) error {
-	return s.publishObject(s.manifestName(m.ID()), m, chunks, tr)
+	return s.publishObject(s.manifestName(m.ID()), m, chunks, tr, s.ttl)
 }
 
 // PublishRaw publishes payload as an object stored under the fully-qualified
@@ -148,15 +148,32 @@ func (s *Server) Publish(m *objectstore.Manifest, chunks [][]byte, tr objectstor
 // mirror schemes use to publish an object under <sha>.g.<zone> or
 // <hash>.f.<zone>; Resolver.FetchRaw reads it back.
 func (s *Server) PublishRaw(fqdn string, payload []byte, tr objectstore.Transport) error {
+	return s.PublishRawTTL(fqdn, payload, tr, s.ttl)
+}
+
+// PublishRawTTL is PublishRaw with ttl on the record at fqdn, for a name whose
+// content changes (a repository's refs). Only that record gets ttl: the chunks
+// and any inner manifests are content-addressed and keep the server's TTL. A
+// later publish to the same name replaces it.
+func (s *Server) PublishRawTTL(fqdn string, payload []byte, tr objectstore.Transport, ttl uint32) error {
 	m, chunks := objectstore.Build(payload)
-	if err := s.publishObject(fqdn, m, chunks, tr); err != nil {
+	if err := s.publishObject(fqdn, m, chunks, tr, ttl); err != nil {
 		return fmt.Errorf("dnszone: publish raw %s: %w", fqdn, err)
 	}
 	return nil
 }
 
-// publishObject stores an object's chunks and then its manifest at fqdn.
-func (s *Server) publishObject(fqdn string, m *objectstore.Manifest, chunks [][]byte, tr objectstore.Transport) error {
+// Has reports whether the server holds a record at fqdn.
+func (s *Server) Has(fqdn string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	_, ok := s.records[nameKey(fqdn)]
+	return ok
+}
+
+// publishObject stores an object's chunks and then its manifest at fqdn, the
+// latter with ttl.
+func (s *Server) publishObject(fqdn string, m *objectstore.Manifest, chunks [][]byte, tr objectstore.Transport, ttl uint32) error {
 	for i, c := range chunks {
 		id := m.ChunkIDs[i]
 		if err := s.store(s.chunkName(id), c, tr); err != nil {
@@ -167,12 +184,12 @@ func (s *Server) publishObject(fqdn string, m *objectstore.Manifest, chunks [][]
 	if err != nil {
 		return fmt.Errorf("marshal manifest: %w", err)
 	}
-	return s.publishManifestBytes(fqdn, mb, tr)
+	return s.publishManifestBytes(fqdn, mb, tr, ttl)
 }
 
-// publishManifestBytes stores manifest bytes at fqdn, going through
+// publishManifestBytes stores manifest bytes at fqdn with ttl, going through
 // objectstore.IndirectManifest so the record stays within MaxRecordPayload.
-func (s *Server) publishManifestBytes(fqdn string, mb []byte, tr objectstore.Transport) error {
+func (s *Server) publishManifestBytes(fqdn string, mb []byte, tr objectstore.Transport, ttl uint32) error {
 	record, ids, chunks, err := objectstore.IndirectManifest(mb)
 	if err != nil {
 		return err
@@ -182,7 +199,7 @@ func (s *Server) publishManifestBytes(fqdn string, mb []byte, tr objectstore.Tra
 			return fmt.Errorf("publish manifest chunk %s: %w", ids[i], err)
 		}
 	}
-	if err := s.store(fqdn, record, tr); err != nil {
+	if err := s.storeTTL(fqdn, record, tr, ttl); err != nil {
 		return fmt.Errorf("publish manifest: %w", err)
 	}
 	return nil
@@ -220,7 +237,7 @@ func (s *Server) LoadStore(dir string, tr objectstore.Transport) error {
 		// The manifest's address is the hash of the bytes served, so derive it
 		// from the file as stored rather than from a re-marshaled copy.
 		id := objectstore.ObjectID(objectstore.ToLabel(objectstore.HashBytes(mb)))
-		if err := s.publishManifestBytes(s.manifestName(id), mb, tr); err != nil {
+		if err := s.publishManifestBytes(s.manifestName(id), mb, tr, s.ttl); err != nil {
 			return fmt.Errorf("dnszone: store manifest %s: %w", id, err)
 		}
 		for i, cid := range m.ChunkIDs {
@@ -312,6 +329,11 @@ func (s *Server) corruptRecord(fqdn string) error {
 // objectstore.MaxRecordPayload are refused so every answer stays small enough
 // for one UDP datagram and the AAAA sequence byte cannot wrap.
 func (s *Server) store(fqdn string, payload []byte, tr objectstore.Transport) error {
+	return s.storeTTL(fqdn, payload, tr, s.ttl)
+}
+
+// storeTTL is store with an explicit record TTL.
+func (s *Server) storeTTL(fqdn string, payload []byte, tr objectstore.Transport, ttl uint32) error {
 	if len(payload) > objectstore.MaxRecordPayload {
 		return fmt.Errorf("dnszone: %d-byte payload for %s exceeds the %d-byte record limit", len(payload), fqdn, objectstore.MaxRecordPayload)
 	}
@@ -321,7 +343,7 @@ func (s *Server) store(fqdn string, payload []byte, tr objectstore.Transport) er
 	case objectstore.TXT:
 		pieces := objectstore.EncodeTXT(objectstore.Frame{Payload: payload})
 		s.setRecords(nameKey(fqdn), []dns.RR{&dns.TXT{
-			Hdr: dns.RR_Header{Name: fqdn, Rrtype: dns.TypeTXT, Class: dns.ClassINET, Ttl: s.ttl},
+			Hdr: dns.RR_Header{Name: fqdn, Rrtype: dns.TypeTXT, Class: dns.ClassINET, Ttl: ttl},
 			Txt: pieces,
 		}})
 	case objectstore.AAAA:
@@ -329,7 +351,7 @@ func (s *Server) store(fqdn string, payload []byte, tr objectstore.Transport) er
 		rrs := make([]dns.RR, 0, len(addrs))
 		for _, a := range addrs {
 			rrs = append(rrs, &dns.AAAA{
-				Hdr:  dns.RR_Header{Name: fqdn, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: s.ttl},
+				Hdr:  dns.RR_Header{Name: fqdn, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: ttl},
 				AAAA: net.IP(a),
 			})
 		}

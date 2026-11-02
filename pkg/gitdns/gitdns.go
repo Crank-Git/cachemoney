@@ -28,13 +28,19 @@ func Publish(s *dnszone.Server, commitSHA string, fetch func(sha string) ([]byte
 
 // PublishAll is Publish for several roots (each a commit or annotated tag),
 // walked in one pass so history shared between them is read and published
-// once. fetch is called one object at a time.
+// once. Objects the server already holds are skipped with everything below
+// them, so publishing again after new commits only reads the new objects.
+// fetch is called one object at a time.
 func PublishAll(s *dnszone.Server, roots []string, fetch func(sha string) ([]byte, error), tr objectstore.Transport) error {
-	objects, err := gitobj.WalkAll(fetch, roots, 1, nil)
+	zone := dnszone.Zone(s.ZoneName())
+	// Objects the server already holds were published with their whole
+	// closure, so a re-publish after new commits only reads what is new.
+	objects, err := gitobj.WalkAll(fetch, roots, 1, func(sha string) bool {
+		return s.Has(dns.Fqdn(sha + ".g." + string(zone)))
+	})
 	if err != nil {
 		return err
 	}
-	zone := dnszone.Zone(s.ZoneName())
 	for sha, o := range objects {
 		fqdn := dns.Fqdn(sha + ".g." + string(zone))
 		if err := s.PublishRaw(fqdn, o.Raw, tr); err != nil {

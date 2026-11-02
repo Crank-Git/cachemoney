@@ -65,8 +65,9 @@ helper at a DNS server and the zone to serve, and `git clone dns:<sha>`
 resolves that commit and streams back the reachable objects.
 
 ```sh
-# Server: publish a repository's history (loose and packed objects) and serve it
-cachemoney serve-git -repo path/to/repo -rev main -zone example.com -addr 127.0.0.1:5300
+# Server: publish a repository's branches, tags, and history and serve them,
+# re-reading the repository every 30 s (-refresh)
+cachemoney serve-git -repo path/to/repo -name myrepo -zone example.com -addr 127.0.0.1:5300
 
 # Client: clone by commit SHA (serve-git prints this command)
 GIT_REMOTE_DNS_ZONE=example.com \
