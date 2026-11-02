@@ -4,9 +4,10 @@
 // objectstore specifies and handed to miekg/dns; a client fetches the records
 // and reassembles them exactly as a resolver would return them.
 //
-// This is the second spike of the project. The label scheme (which suffix
-// identifies a chunk vs. a manifest, which zone hosts the records) is a
-// working model to iterate on — see the README "Open questions".
+// Records live under one zone with a label per scheme: <chunkid>.c for
+// chunks, <id>.o for content-addressed manifests, <sha>.g for git objects,
+// and <hash>.f for mirror files. Which zone hosts the records is still open
+// (see the README "Open questions").
 package dnszone
 
 import (
@@ -187,12 +188,10 @@ func (s *Server) publishManifestBytes(fqdn string, mb []byte, tr objectstore.Tra
 	return nil
 }
 
-// manifestName and chunkName build the fully-qualified names for a manifest
-// and a chunk. The .o / .c suffixes distinguish record kinds and leave room
-// for the .g (git) and .refs schemes without re-addressing existing objects.
 // LoadStore loads objects from a local store directory into the in-memory
 // record set, framed with tr. Each manifest is served under the hash of its
-// file bytes, the address a client verifies it against. The layout matches the CLI put command:
+// file bytes, the address a client verifies it against. The layout matches
+// the CLI put command:
 //
 //	<dir>/manifests/<id>.json   raw manifest bytes
 //	<dir>/chunks/<chunkid>      raw chunk bytes
@@ -240,6 +239,9 @@ func (s *Server) LoadStore(dir string, tr objectstore.Transport) error {
 	return nil
 }
 
+// manifestName and chunkName build the fully-qualified names for a manifest
+// and a chunk. The .o / .c suffixes distinguish record kinds from the .g (git)
+// and .f (mirror) schemes.
 func (s *Server) manifestName(id objectstore.ObjectID) string {
 	return dns.Fqdn(fmt.Sprintf("%s.o.%s", id, s.zone))
 }
@@ -533,7 +535,6 @@ func (s *Server) soa() *dns.SOA {
 // lowercased form.
 func nameKey(name string) string { return strings.ToLower(name) }
 
-// Shutdown stops the server and releases its ports.
 // CorruptAAAA flips a payload octet in the first AAAA record at fqdn so the
 // decoded content no longer matches its hash, letting tests exercise corruption
 // detection. It is intended for tests and panics if the record is missing or
@@ -545,6 +546,7 @@ func (s *Server) CorruptAAAA(fqdn string) {
 	rec.AAAA[6] ^= 0x01
 }
 
+// Shutdown stops the server and releases its ports.
 func (s *Server) Shutdown() {
 	if s.srv != nil {
 		_ = s.srv.Shutdown()

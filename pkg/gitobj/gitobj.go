@@ -4,9 +4,9 @@
 // commits, and walks a repository from a commit down to its blobs, verifying
 // every object on the way.
 //
-// This is the second spike of the project. The object model follows the Git
-// wire format exactly so SHAs match `git hash-object` and `git mktree`; the
-// DNS transport that stores and fetches these objects lives in pkg/gitdns.
+// The object model follows the Git wire format exactly so SHAs match
+// `git hash-object` and `git mktree`; the DNS transport that stores and
+// fetches these objects lives in pkg/gitdns.
 package gitobj
 
 import (

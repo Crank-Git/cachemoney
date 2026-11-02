@@ -1,6 +1,6 @@
 // Package pkgindex models a package file index: a canonical, path-sorted list
 // of file entries (path, mode, size, sha256) with a method to verify a file
-// against it. This is the pure, DNS-agnostic core of the apt/Nix mirror spike.
+// against it. This is the pure, DNS-agnostic core of pkg/mirror.
 //
 // The DNS transport that stores and serves the index and the files it lists
 // lives elsewhere; this package only cares about the index's canonical bytes

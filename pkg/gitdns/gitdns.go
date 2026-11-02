@@ -1,16 +1,12 @@
 // Package gitdns publishes and fetches Git object graphs over DNS using the
-// cachemoney objectstore framing. Each Git object is stored as one cachemoney
-// object whose payload is the object's raw (uncompressed) bytes and whose
-// address is the object's git SHA-1 under the ".g" label: <sha>.g.<zone>.
+// cachemoney objectstore framing. Each Git object's raw (uncompressed) bytes
+// are published with dnszone.Server.PublishRaw: chunked under <chunkid>.c,
+// with the object's manifest at its git SHA-1 under the ".g" label,
+// <sha>.g.<zone>. Fetch verifies every object's SHA-1 as it arrives, so the
+// git SHA is the trust anchor.
 //
-// This is the second spike's transport half. The pure object model lives in
-// pkg/gitobj; the DNS server and resolver live in pkg/dnszone.
-//
-// Over the AAAA transport, the final record is right-padded with null bytes;
-// dnszone.Resolver.FetchRaw trims that padding before returning, so a fetched
-// object is exact unless its content itself ends in a null byte (the same
-// limitation the manifest scheme has). The TXT transport pads nothing and is
-// always exact.
+// The pure object model lives in pkg/gitobj; the DNS server and resolver live
+// in pkg/dnszone.
 package gitdns
 
 import (

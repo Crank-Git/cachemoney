@@ -55,12 +55,12 @@ func rawAnswer(t *testing.T, network, addr string, q *dns.Msg) []byte {
 	return buf[:n]
 }
 
-// TestAnswerNamesAreCompressed measures a 1 KB AAAA chunk answer on the wire
+// TestAnswerNamesAreCompressed measures a full AAAA chunk answer on the wire
 // over TCP, UDP with EDNS, and UDP without EDNS. With name compression every
 // AAAA record costs exactly 28 bytes (2-byte pointer, type, class, TTL,
 // rdlength, 16-byte address). TCP and non-EDNS UDP answers used to go out
-// uncompressed at 6570 bytes; only EDNS UDP answers were compressed, as a side
-// effect of truncation.
+// uncompressed (6570 bytes for a 1 KB chunk); only EDNS UDP answers were
+// compressed, as a side effect of truncation.
 func TestAnswerNamesAreCompressed(t *testing.T) {
 	srv, _, shutdown := newTestServer(t, objectstore.AAAA)
 	defer shutdown()
