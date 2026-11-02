@@ -46,6 +46,42 @@ A client walks the graph:
 - The manifest records each chunk's exact length, so decoders can trim padding
   before hashing.
 
+### Cloning a repository over DNS (`git clone dns:<sha>`)
+
+Git can clone a repository whose objects are served over DNS instead of HTTP,
+SSH, or SFTP. On demand it spawns a `git-remote-dns` helper; you point the
+helper at a DNS server and the zone to serve, and `git clone dns:<sha>`
+resolves that commit and streams back the reachable objects.
+
+```sh
+# Client: clone by root commit SHA
+GIT_REMOTE_DNS_ZONE=example.com \
+GIT_REMOTE_DNS_SERVER=127.0.0.1:5300 \
+git clone dns:0123456789abcdef0123456789abcdef01234567 https://example.com/repo.git
+
+# Server: publish one repo's objects over DNS (see pkg/gitdns)
+gitdns.Publish(server, "<root-sha>", func(sha string) ([]byte, error) {
+	p := filepath.Join(repo, ".git", "objects", sha[:2], sha[2:])
+	return os.ReadFile(p)
+}, objectstore.TXT)
+```
+
+git launches the helper as `git-remote-dns <remote> dns://<sha>`. It answers:
+
+- `list` — the commit SHA plus a HEAD symref to `refs/heads/main`.
+- `fetch` — the reachable objects, materialized into git's object store via
+  `git unpack-objects` (git's fetch path never consumes the pack the helper
+  emits).
+
+Configuration comes from the environment git passes to helpers:
+
+| Env var | Required | Default | Purpose |
+| --- | --- | --- | --- |
+| `GIT_REMOTE_DNS_ZONE` | yes | — | DNS zone to resolve against |
+| `GIT_REMOTE_DNS_SERVER` | no | `127.0.0.1:5300` | Resolver host:port |
+| `GIT_REMOTE_DNS_TRANSPORT` | no | `txt` | `txt` or `aaaa` |
+| `GIT_REMOTE_DNS_TIMEOUT` | no | `5s` | Resolver timeout |
+
 ## Repository layout
 
 ```
