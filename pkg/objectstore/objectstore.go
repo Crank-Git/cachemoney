@@ -17,6 +17,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -95,14 +96,56 @@ func (m *Manifest) ID() ObjectID {
 	return ObjectID(ToLabel(HashBytes(b)))
 }
 
-// UnmarshalManifest parses manifest bytes. The manifest's own ID can be derived
-// from these bytes, so a stored file and its address are mutually verifiable.
+// UnmarshalManifest parses manifest bytes and validates them (see Validate).
+// The manifest's own ID can be derived from these bytes, so a stored file and
+// its address are mutually verifiable.
 func UnmarshalManifest(b []byte) (*Manifest, error) {
 	var m Manifest
 	if err := json.Unmarshal(b, &m); err != nil {
 		return nil, fmt.Errorf("objectstore: unmarshal manifest: %w", err)
 	}
+	if err := m.Validate(); err != nil {
+		return nil, err
+	}
 	return &m, nil
+}
+
+// VerifyManifest parses manifest bytes fetched under id, first checking that
+// the bytes hash to id. It is how a client trusts a manifest it did not build:
+// the address is the hash, so bytes that do not hash to it are rejected before
+// any field is read.
+func VerifyManifest(id ObjectID, b []byte) (*Manifest, error) {
+	if got := ObjectID(ToLabel(HashBytes(b))); got != id {
+		return nil, fmt.Errorf("objectstore: manifest %s hash mismatch (got %s)", id, got)
+	}
+	return UnmarshalManifest(b)
+}
+
+// Validate checks that a manifest is internally consistent: a known version,
+// one length per chunk id, a chunk count that matches, non-negative lengths,
+// and lengths that sum to the total size. A manifest that fails Validate is
+// never used to reassemble an object.
+func (m *Manifest) Validate() error {
+	if m.Version != ManifestVersion {
+		return fmt.Errorf("objectstore: unsupported manifest version %d", m.Version)
+	}
+	if m.ChunkCount != len(m.ChunkIDs) || len(m.ChunkLens) != len(m.ChunkIDs) {
+		return fmt.Errorf("objectstore: manifest chunk count %d, ids %d, lens %d disagree", m.ChunkCount, len(m.ChunkIDs), len(m.ChunkLens))
+	}
+	var total int64
+	for i, n := range m.ChunkLens {
+		if n < 0 {
+			return fmt.Errorf("objectstore: manifest chunk %d has negative length %d", i, n)
+		}
+		if n > math.MaxInt64-total {
+			return fmt.Errorf("objectstore: manifest chunk lengths overflow")
+		}
+		total += n
+	}
+	if total != m.TotalSize {
+		return fmt.Errorf("objectstore: manifest chunk lengths sum to %d, total size is %d", total, m.TotalSize)
+	}
+	return nil
 }
 
 // Build splits data into chunks and returns a manifest plus the raw chunk
@@ -266,9 +309,12 @@ func DecodeAAAA(addrs [][]byte) ([]byte, error) {
 }
 
 // Reassemble concatenates the ordered chunks and verifies every hash against
-// the manifest. It returns an error (never silent corruption) if any chunk is
-// missing, reordered, or tampered.
+// the manifest. It returns an error (never silent corruption) if the manifest
+// is inconsistent or any chunk is missing, reordered, or tampered.
 func Reassemble(m *Manifest, chunks map[ObjectID][]byte) ([]byte, error) {
+	if err := m.Validate(); err != nil {
+		return nil, err
+	}
 	var out []byte
 	for i, id := range m.ChunkIDs {
 		c, ok := chunks[id]

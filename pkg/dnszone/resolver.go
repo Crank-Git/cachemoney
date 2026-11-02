@@ -257,18 +257,20 @@ func (r *Resolver) FetchByID(id objectstore.ObjectID, tr objectstore.Transport) 
 	return obj, nil
 }
 
-// resolveManifest fetches and parses the manifest for the given id from the
-// server. The framing (DecodeTXT/DecodeAAAA) returns the payload exactly: the
-// AAAA length prefix disambiguates the right-padding of the final record from
-// content, so nothing is trimmed.
+// resolveManifest fetches the manifest for the given id from the server and
+// verifies it: the bytes must hash to id and describe a consistent object, or
+// the manifest is rejected before any chunk is fetched. The framing
+// (DecodeTXT/DecodeAAAA) returns the payload exactly: the AAAA length prefix
+// disambiguates the right-padding of the final record from content, so
+// nothing is trimmed.
 func (r *Resolver) resolveManifest(id objectstore.ObjectID, tr objectstore.Transport) (*objectstore.Manifest, uint32, error) {
 	raw, ttl, err := r.fetch(dns.Fqdn(fmt.Sprintf("%s.%s.%s", id, r.suffix, r.zone)), tr)
 	if err != nil {
 		return nil, 0, fmt.Errorf("fetch manifest %s: %w", id, err)
 	}
-	m, err := objectstore.UnmarshalManifest(raw)
+	m, err := objectstore.VerifyManifest(id, raw)
 	if err != nil {
-		return nil, 0, fmt.Errorf("parse manifest %s: %w", id, err)
+		return nil, 0, fmt.Errorf("verify manifest %s: %w", id, err)
 	}
 	return m, ttl, nil
 }
