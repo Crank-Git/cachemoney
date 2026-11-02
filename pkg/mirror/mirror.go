@@ -1,9 +1,11 @@
 // Package mirror publishes and fetches package-file indices and the files they
-// list over DNS, the transport half of the apt/Nix mirror spike.
+// list over DNS. It is the transport model an apt or Nix mirror would sit on;
+// it does not speak either package manager's protocol.
 //
-// Each file is stored as a raw record under <sha256>.f.<zone> and the index
-// listing its files is stored under <indexhash>.f.<zone>, using the "f" label
-// scheme so it never collides with the manifest ("o") or git ("g") schemes. A
+// Each file is published with dnszone.Server.PublishRaw under the base32 of
+// its sha256, <sha256>.f.<zone>, and the index listing the files under the
+// base32 of its own hash, <indexhash>.f.<zone>, using the "f" label scheme so
+// it never collides with the manifest ("o") or git ("g") schemes. A
 // client fetches the index by hash, then a file by path (looking up the path's
 // sha256 in the index and fetching that record), verifying the file's size and
 // sha256 against the index.

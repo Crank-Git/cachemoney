@@ -3,7 +3,7 @@
 **Content-addressed objects over DNS.** Objects (git commits/trees/blobs, packages,
 arbitrary blobs) live at names derived from their own hash, resolvable with plain
 DNS queries. Because the address *is* the content, caching is always correct, and
-max TTLs turn every resolver on Earth into a free CDN.
+long TTLs turn every resolver on Earth into a free CDN.
 
 ## Why
 
@@ -11,8 +11,10 @@ max TTLs turn every resolver on Earth into a free CDN.
   that fetched `<id>` once can serve it forever; the bytes can't drift.
 - **Every resolver is a free CDN.** With long TTLs on immutable objects, a single
   origin is served by millions of cached copies.
-- **Refs are the only mutable, short-TTL records.** `main.refs.<repo>` points at a
-  commit; everything behind it is immutable.
+- **Refs would be the only mutable, short-TTL records.** A name like
+  `main.refs.<repo>` would point at a commit, with everything behind it immutable.
+  Refs are not implemented yet (see [Open questions](#open-questions)); today a
+  repository is cloned by commit SHA.
 
 ## How addressing works
 
@@ -20,28 +22,40 @@ This uses the **variant** scheme (chunks named by their own hash, shared across
 repos, with manifests):
 
 ```
-<chunkid>.c.<zone>            # a chunk, addressed by the hash of its bytes
-<id>.o.<zone>                 # a generic object's manifest
-<gitsha>.g.<zone>             # a git object's manifest
-main.refs.<repo>.<zone>       # mutable pointer → commit sha (short TTL)
+<chunkid>.c.<zone>            # a chunk (≤ 512 B), addressed by the hash of its bytes
+<id>.o.<zone>                 # a generic object's manifest, addressed by the manifest's hash
+<gitsha>.g.<zone>             # a git object's manifest, addressed by its git SHA-1
+<sha256>.f.<zone>             # a mirror file's (or index's) manifest, addressed by its sha256
 ```
 
 A client walks the graph:
 
-1. resolve `main.refs.<repo>` → commit sha
-2. fetch the commit manifest `<gitsha>.g`
-3. fetch the tree manifest, then each blob manifest + chunk
-4. reassemble and verify every hash before trusting bytes
+1. start from a commit SHA (`git clone dns://<sha>`)
+2. fetch the commit's manifest at `<gitsha>.g`, then its chunks
+3. fetch the tree, blobs, and parents the same way, many at once
+4. verify every chunk hash, and every git object's SHA-1, before trusting bytes
 
-### Framing (current model)
+### Framing
 
 - A SHA‑256 hash is 64 hex chars — too long for a 63‑char DNS label. We use
-  **base32** (~51 chars) instead.
-- Chunks fit a 1232‑byte UDP answer: **1024 B** raw TXT, **768 B** base64 TXT, or
-  **15 B** per AAAA record (the 16th byte carries a sequence number so resolver
-  reordering can't corrupt data).
-- The manifest records each chunk's exact length, so decoders can trim padding
-  before hashing.
+  **base32** (52 chars) instead. Labels are matched case-insensitively.
+- Every record holds at most **512 B** of payload, so every answer fits a
+  1232‑byte EDNS buffer (DNS flag day 2020) for zones up to ~150 characters: a
+  chunk is ~800 B as TXT (base64 in `<seq>:` strings) or ~1075 B as 35 AAAA
+  records. Each AAAA record carries **15 B**; its first byte is a sequence
+  number so resolver reordering can't corrupt data.
+- AAAA payloads start with a 4‑byte length, so trailing padding is never
+  mistaken for content.
+- A manifest too large for one record is stored **indirectly**: the record holds
+  a small manifest (`"indirect": true`) whose chunks reassemble to the real one,
+  nested as needed (at most 16 levels). The object's manifest is still verified
+  against its id.
+- Records carry a one‑day TTL; negative answers are cached for 60 s.
+
+The server answers as a standard authoritative server (SOA/NS at the apex,
+NXDOMAIN, REFUSED outside the zone, EDNS0). The test suite runs it behind a real
+Unbound resolver with 0x20 case randomization and QNAME minimization, including
+serving objects from the resolver's cache with the origin shut down.
 
 ### Cloning a repository over DNS (`git clone dns:<sha>`)
 
@@ -89,9 +103,10 @@ pkg/dnszone/       authoritative server (serve) + client resolver (fetch) over U
 pkg/gitobj/        Git object model (commit/tree/blob hashing, graph walk)
 pkg/gitdns/        publish/fetch Git object graphs over DNS
 pkg/pkgindex/      package-file index model
-pkg/mirror/        apt/Nix binary-cache mirror over DNS
-cmd/cachemoney/    CLI (`put`/`get` a local store, `serve` an authoritative server, `fetch` over DNS)
-.github/workflows/ CI (build, gofmt, unit + integration tests, vet, coverage)
+pkg/mirror/        package index + file transport over DNS (the model for an apt/Nix mirror)
+cmd/cachemoney/    CLI (`put`/`get` a local store, `serve` it, `serve-git` a repository, `fetch` over DNS)
+cmd/git-remote-dns/ git remote helper for `git clone dns://<sha>`
+.github/workflows/ CI (build, gofmt, unit + integration tests incl. Unbound, vet, coverage)
 ```
 
 ## Development
@@ -105,7 +120,9 @@ go vet ./...
 ```
 
 CI runs on every PR and on push to `dev`/`main`: build, `gofmt`, unit +
-integration tests (`-race`), vet, and a coverage gate.
+integration tests (`-race`, including a recursive-resolver test against
+Unbound), vet, and a coverage gate. Locally the Unbound test is skipped if
+`unbound` is not installed.
 
 ## Branch model
 
@@ -130,12 +147,14 @@ All planned work is complete:
 1. **Object store core** ✅ — chunking, manifests, TXT/AAAA framing, verification.
 2. **Authoritative DNS layer** ✅ — in-memory nameserver (`serve`) and client resolver (`fetch`) over UDP/TCP.
 3. **Client resolver** ✅ — walks the object graph over DNS with EDNS0 + TCP fallback for truncated answers.
-4. **Git over DNS** ✅ — `gitobj` model and `gitdns` publish/fetch of Git object graphs.
-5. **Package caches** ✅ — `pkgindex` model and `mirror` apt/Nix binary-cache mirror.
+4. **Git over DNS** ✅ — `gitobj` model, `gitdns` publish/fetch of Git object graphs, `serve-git`, and the `git-remote-dns` helper.
+5. **Package caches** ✅ — `pkgindex` model and `mirror` index/file transport (no apt or Nix protocol front end yet).
 
 ## Open questions
 
 - Which TLD/zone hosts the records, and how contributors publish authoritatively.
+- Mutable refs (`main.refs.<repo>`, short TTL) so a repository can be cloned by
+  name rather than by commit SHA.
 
 ## License
 

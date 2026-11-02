@@ -4,10 +4,6 @@
 // them in a content-addressed manifest, and frames each chunk for DNS
 // transport (TXT or AAAA). Because every piece is addressed by its hash,
 // caching is always correct: identical bytes always share one identity.
-//
-// This is the first spike of the project. The on-wire DNS framing here is a
-// working, tested model; the exact label scheme is a spec to be finalized
-// with contributors (see README "Open questions").
 package objectstore
 
 import (
