@@ -25,15 +25,15 @@ const testSHA = "0123456789abcdef0123456789abcdef01234567"
 // a whitespace-padded form.
 func TestParseURL(t *testing.T) {
 	cases := []struct {
-		name  string
-		in    string
-		want  string
+		name string
+		in   string
+		want string
 	}{
 		{"dns-slash-slash", "dns://" + testSHA, testSHA},
 		{"dns-colon-colon", "dns::" + testSHA, testSHA},
 		{"bare", testSHA, testSHA},
 		{"padded", "  " + testSHA + "  ", testSHA},
-		{"dns-slash-slash-slashes", "dns:///"+testSHA, testSHA},
+		{"dns-slash-slash-slashes", "dns:///" + testSHA, testSHA},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -52,11 +52,11 @@ func TestParseURL(t *testing.T) {
 // length and non-hex characters.
 func TestParseURLErrors(t *testing.T) {
 	bad := []string{
-		"dns://abc",          // too short
+		"dns://abc",                        // too short
 		"dns://" + strings.Repeat("a", 41), // too long
 		"dns://" + strings.Repeat("z", 40), // non-hex
 		"dns://" + strings.Repeat("g", 40), // non-hex
-		"",                   // empty
+		"",                                 // empty
 	}
 	for _, in := range bad {
 		if _, err := parseURL(in); err == nil {

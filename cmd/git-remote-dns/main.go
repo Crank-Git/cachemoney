@@ -41,7 +41,7 @@ import (
 // helper is a single git-remote-dns invocation: it knows the object id to
 // serve, the resolver used to fetch it over DNS, and the transport.
 type helper struct {
-	id        string       // hex SHA-1 of the root commit to serve
+	id        string // hex SHA-1 of the root commit to serve
 	r         *dnszone.Resolver
 	transport objectstore.Transport
 	out       *bufio.Writer
@@ -49,10 +49,10 @@ type helper struct {
 
 // config holds the helper's environment-driven settings.
 type config struct {
-	server   string
-	zone     string
+	server    string
+	zone      string
 	transport string
-	timeout  string
+	timeout   string
 }
 
 func main() {
