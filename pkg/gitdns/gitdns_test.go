@@ -2,8 +2,11 @@ package gitdns
 
 import (
 	"fmt"
+	"net"
 	"strconv"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/miekg/dns"
 
@@ -277,5 +280,90 @@ func TestPublishFetchLargeBlob(t *testing.T) {
 				t.Fatal("large blob did not round-trip")
 			}
 		})
+	}
+}
+
+// startCountingProxy forwards DNS queries to upstream after a delay and
+// records the peak number handled at once, so a test can see whether the
+// client overlaps its queries.
+func startCountingProxy(t *testing.T, upstream string, delay time.Duration) (string, *atomic.Int64) {
+	t.Helper()
+	var inflight, peak atomic.Int64
+	handler := dns.HandlerFunc(func(w dns.ResponseWriter, req *dns.Msg) {
+		n := inflight.Add(1)
+		defer inflight.Add(-1)
+		for {
+			p := peak.Load()
+			if n <= p || peak.CompareAndSwap(p, n) {
+				break
+			}
+		}
+		time.Sleep(delay)
+		resp, _, err := (&dns.Client{Net: "tcp"}).Exchange(req, upstream)
+		if err != nil {
+			fail := new(dns.Msg)
+			fail.SetRcode(req, dns.RcodeServerFailure)
+			resp = fail
+		}
+		resp.Truncate(1232)
+		_ = w.WriteMsg(resp)
+	})
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &dns.Server{PacketConn: pc, Handler: handler}
+	go func() { _ = srv.ActivateAndServe() }()
+	t.Cleanup(func() { _ = srv.Shutdown() })
+	return pc.LocalAddr().String(), &peak
+}
+
+// TestFetchOverlapsObjectQueries fetches a 30-commit history (10 files per
+// commit) through a proxy that adds 10 ms per query. Fetch used to walk one
+// object per round trip; it now keeps up to the resolver's concurrency in
+// flight. (A chain of commits is still one round trip per commit, since each
+// parent is only known once its child arrives; the trees and blobs under
+// each commit are what fan out.)
+func TestFetchOverlapsObjectQueries(t *testing.T) {
+	objects := map[string][]byte{}
+	put := func(kind gitobj.Kind, content []byte) string {
+		sha := gitobj.ObjectSHA(kind, content)
+		objects[sha] = rawBytes(kind, content)
+		return sha
+	}
+	parent := ""
+	for i := 0; i < 30; i++ {
+		var entries []gitobj.Entry
+		for f := 0; f < 10; f++ {
+			blob := put(gitobj.Blob, []byte(fmt.Sprintf("commit %d file %d\n", i, f)))
+			entries = append(entries, gitobj.Entry{Mode: "100644", Name: fmt.Sprintf("f%02d", f), SHA: blob})
+		}
+		tree := put(gitobj.Tree, gitobj.MarshalTree(entries))
+		c := "tree " + tree + "\n"
+		if parent != "" {
+			c += "parent " + parent + "\n"
+		}
+		parent = put(gitobj.Commit, []byte(c+fmt.Sprintf("author A <a@x> %d +0000\ncommitter A <a@x> %d +0000\n\nc%d\n", i, i, i)))
+	}
+	srv := dnszone.NewServer(dnszone.Zone("example.com"), 0)
+	if err := srv.Start("127.0.0.1:0"); err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Shutdown()
+	if err := Publish(srv, parent, func(sha string) ([]byte, error) { return objects[sha], nil }, objectstore.TXT); err != nil {
+		t.Fatal(err)
+	}
+	proxy, peak := startCountingProxy(t, "127.0.0.1:"+strconv.Itoa(srv.Port()), 10*time.Millisecond)
+
+	r := dnszone.NewResolver(proxy, dnszone.Zone("example.com"), 2*time.Second).WithObjectSuffix("g").WithConcurrency(16)
+	got, err := Fetch(r, parent, objectstore.TXT)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if len(got) != len(objects) {
+		t.Fatalf("fetched %d objects, want %d", len(got), len(objects))
+	}
+	if p := peak.Load(); p < 4 {
+		t.Fatalf("peak concurrent queries %d; Fetch is not overlapping object fetches", p)
 	}
 }

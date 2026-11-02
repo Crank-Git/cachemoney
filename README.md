@@ -51,17 +51,18 @@ helper at a DNS server and the zone to serve, and `git clone dns:<sha>`
 resolves that commit and streams back the reachable objects.
 
 ```sh
-# Client: clone by root commit SHA
+# Server: publish a repository's history (loose and packed objects) and serve it
+cachemoney serve-git -repo path/to/repo -rev main -zone example.com -addr 127.0.0.1:5300
+
+# Client: clone by commit SHA (serve-git prints this command)
 GIT_REMOTE_DNS_ZONE=example.com \
 GIT_REMOTE_DNS_SERVER=127.0.0.1:5300 \
-git clone dns:0123456789abcdef0123456789abcdef01234567 https://example.com/repo.git
-
-# Server: publish one repo's objects over DNS (see pkg/gitdns)
-gitdns.Publish(server, "<root-sha>", func(sha string) ([]byte, error) {
-	p := filepath.Join(repo, ".git", "objects", sha[:2], sha[2:])
-	return os.ReadFile(p)
-}, objectstore.TXT)
+git clone dns://0123456789abcdef0123456789abcdef01234567
 ```
+
+From Go, `gitdns.Publish(server, sha, fetch, transport)` publishes a graph given
+a `fetch` that returns an object's raw, uncompressed bytes
+(`"<type> <size>\x00<content>"`, as `git cat-file --batch` provides).
 
 git launches the helper as `git-remote-dns <remote> dns://<sha>`. It answers:
 

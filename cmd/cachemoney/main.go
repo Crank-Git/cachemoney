@@ -28,7 +28,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) < 1 {
-		return errors.New("usage: cachemoney <put|get> [flags]")
+		return errors.New("usage: cachemoney <put|get|serve|serve-git|fetch> [flags]")
 	}
 	cmd, rest := args[0], args[1:]
 
@@ -39,10 +39,12 @@ func run(args []string) error {
 		return get(rest)
 	case "serve":
 		return serve(rest)
+	case "serve-git":
+		return serveGit(rest)
 	case "fetch":
 		return fetch(rest)
 	default:
-		return fmt.Errorf("unknown command %q (want put, get, serve, or fetch)", cmd)
+		return fmt.Errorf("unknown command %q (want put, get, serve, serve-git, or fetch)", cmd)
 	}
 }
 
