@@ -1,10 +1,12 @@
 package main
 
 import (
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/Crank-Git/cachemoney/pkg/objectstore"
 )
@@ -164,5 +166,30 @@ func TestServeBadAddr(t *testing.T) {
 	// Port 1 cannot be bound by a normal process, so Start fails.
 	if err := run([]string{"serve", "-store", dir, "-addr", "127.0.0.1:1", "-zone", "example.com"}); err == nil {
 		t.Fatal("serve succeeded with unbindable address, want error")
+	}
+}
+
+// TestServeFailsOnBusyPort occupies the TCP side of a port and runs serve on
+// it. serve used to block forever; it must return the bind error.
+func TestServeFailsOnBusyPort(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "manifests"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- run([]string{"serve", "-store", dir, "-addr", ln.Addr().String()}) }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("serve succeeded on a busy port, want error")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("serve blocked on a busy port instead of returning an error")
 	}
 }
