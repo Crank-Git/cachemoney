@@ -56,10 +56,18 @@ type config struct {
 }
 
 func main() {
-	if err := run(os.Args); err != nil {
+	os.Exit(runMain(os.Args))
+}
+
+// runMain drives the helper and returns the process exit code: 0 on success,
+// 1 on error. Extracted from main so the error path is testable without calling
+// os.Exit, which would terminate the test process.
+func runMain(args []string) int {
+	if err := run(args); err != nil {
 		fmt.Fprintln(os.Stderr, "git-remote-dns:", err)
-		os.Exit(1)
+		return 1
 	}
+	return 0
 }
 
 // run parses the URL from git's arguments, applies the environment config, and
