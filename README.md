@@ -5,9 +5,6 @@ arbitrary blobs) live at names derived from their own hash, resolvable with plai
 DNS queries. Because the address *is* the content, caching is always correct, and
 max TTLs turn every resolver on Earth into a free CDN.
 
-> Research / prototype spike. The wire format and labels are a working model to
-> iterate on — see [Open questions](#open-questions).
-
 ## Why
 
 - **Content-addressed data never changes → caching is always correct.** A resolver
@@ -139,8 +136,6 @@ All planned work is complete:
 - Parallel / concurrent fetch to keep latency down under many in-flight queries.
 - DoH/DoT transports in addition to plain DNS.
 - Resolver-side caching for hot objects.
-- A `git-remote-dns` helper so `git clone` works over DNS.
-- Which TLD/zone hosts the records, and how contributors publish authoritatively.
 
 ## Open questions
 
