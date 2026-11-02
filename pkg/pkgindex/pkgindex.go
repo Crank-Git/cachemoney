@@ -88,7 +88,8 @@ func (i *Index) Marshal() []byte {
 }
 
 // ParseIndex parses canonical bytes produced by Marshal. It rejects malformed
-// headers, truncated paths, and duplicate paths.
+// headers, truncated paths, non-canonical sizes and hashes, and paths that are
+// duplicated or out of order, so only one byte string parses to a given index.
 func ParseIndex(raw []byte) (*Index, error) {
 	var entries []Entry
 	i := 0
@@ -113,13 +114,38 @@ func ParseIndex(raw []byte) (*Index, error) {
 		if err != nil {
 			return nil, fmt.Errorf("pkgindex: bad size %q: %w", sizeStr, err)
 		}
-		if len(sha) != 64 {
+		if size < 0 || strconv.Itoa(size) != sizeStr {
+			return nil, fmt.Errorf("pkgindex: non-canonical size %q", sizeStr)
+		}
+		if !isLowerHex(sha, 64) {
 			return nil, fmt.Errorf("pkgindex: bad sha256 %q", sha)
+		}
+		if n := len(entries); n > 0 {
+			switch prev := entries[n-1].Path; {
+			case path == prev:
+				return nil, fmt.Errorf("pkgindex: duplicate path %q", path)
+			case path < prev:
+				return nil, fmt.Errorf("pkgindex: path %q out of order after %q", path, prev)
+			}
 		}
 		entries = append(entries, Entry{Path: path, Mode: mode, Size: size, SHA256: sha})
 		i = pathStart + pathEnd + 1
 	}
 	return &Index{Entries: entries}, nil
+}
+
+// isLowerHex reports whether s is exactly n lowercase hex digits, the form
+// Marshal writes and Verify compares against.
+func isLowerHex(s string, n int) bool {
+	if len(s) != n {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; !('0' <= c && c <= '9' || 'a' <= c && c <= 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // splitHeader parses a "mode SP size SP sha256" header into its three fields.
