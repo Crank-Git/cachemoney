@@ -52,6 +52,35 @@ Both integration branches are protected:
 
 There is no direct push to either branch.
 
+Required status checks: `test` on `dev`; `build`, `format`, `test`, and `vet` on `main`.
+
+## CI
+
+`.github/workflows/test.yml` runs on every PR into `dev` or `main` and on every push to
+them. Each job is a separate status check:
+
+- **build**: `go build ./...`
+- **format**: `gofmt -l` must print nothing.
+- **vet**: `go vet ./...`
+- **test**: `go test -race -coverprofile=coverage.out ./...` with `CACHEMONEY_REQUIRE_UNBOUND=1`,
+  so the recursive-resolver test runs against a real Unbound. Total coverage must stay at
+  70% or more.
+
+Locally, the Unbound test is skipped if `unbound` isn't installed.
+
+## Repository layout
+
+```
+pkg/objectstore/    content-addressed core: chunking, manifests, TXT/AAAA framing, verify
+pkg/dnszone/        authoritative server (serve) + client resolver (fetch) over UDP/TCP
+pkg/gitobj/         Git object model (commit/tree/blob hashing, graph walk)
+pkg/gitdns/         publish/fetch Git object graphs over DNS
+pkg/pkgindex/       package-file index model
+pkg/mirror/         package index + file transport over DNS (the model for an apt/Nix mirror)
+cmd/cachemoney/     CLI (`put`/`get` a local store, `serve` it, `serve-git` a repository, `fetch` over DNS)
+cmd/git-remote-dns/ git remote helper for `git clone dns://<repo-or-sha>`
+```
+
 ## Commit conventions
 
 - Keep commits focused and atomic; one logical change per commit.
