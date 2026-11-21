@@ -1,177 +1,134 @@
-# cachemoney
+<p align="center">
+  <img src="assets/brand/banner.svg" alt="cachemoney: a terminal running cachemoney serve-git on a local repository, which answers that it is serving the repository as cachemoney and prints the git clone dns://cachemoney command." width="100%">
+</p>
 
-**Content-addressed objects over DNS.** Objects (git commits/trees/blobs, packages,
-arbitrary blobs) live at names derived from their own hash, resolvable with plain
-DNS queries. Because the address *is* the content, caching is always correct, and
-long TTLs turn every resolver on Earth into a free CDN.
+<p align="center"><b>Content-addressed objects over DNS.</b> Git objects, packages, and blobs, resolvable through TXT and AAAA records.</p>
 
-## Why
+<p align="center">
+  <a href="https://github.com/Crank-Git/cachemoney/actions/workflows/test.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/Crank-Git/cachemoney/test.yml?branch=dev&style=flat-square&label=ci&labelColor=30363d"></a>
+  <img alt="Go version" src="https://img.shields.io/github/go-mod/go-version/Crank-Git/cachemoney?style=flat-square&label=go&labelColor=30363d&color=7ee787">
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/github/license/Crank-Git/cachemoney?style=flat-square&labelColor=30363d&color=7ee787"></a>
+</p>
 
-- **Content-addressed data never changes → caching is always correct.** A resolver
-  that fetched `<id>` once can serve it forever; the bytes can't drift.
-- **Every resolver is a free CDN.** With long TTLs on immutable objects, a single
-  origin is served by millions of cached copies.
-- **Refs are the only mutable, short-TTL records.** `<repo>.refs.<zone>` lists a
-  repository's branches and tags; everything they point at is immutable.
+<p align="center">
+  <a href="docs/addressing.md"><b>Docs</b></a> ·
+  <a href="#install"><b>Install</b></a> ·
+  <a href="#quick-start"><b>Quick start</b></a>
+</p>
 
-## How addressing works
-
-This uses the **variant** scheme (chunks named by their own hash, shared across
-repos, with manifests):
-
-```
-<chunkid>.c.<zone>            # a chunk (≤ 512 B), addressed by the hash of its bytes
-<id>.o.<zone>                 # a generic object's manifest, addressed by the manifest's hash
-<gitsha>.g.<zone>             # a git object's manifest, addressed by its git SHA-1
-<sha256>.f.<zone>             # a mirror file's (or index's) manifest, addressed by its sha256
-<repo>.refs.<zone>            # a repository's ref list (mutable, 60 s TTL)
+```mermaid
+flowchart LR
+  G[git clone dns://repo] -->|refs, then manifests and chunks| R[Recursive resolver]
+  R -->|cache miss| S[cachemoney serve-git]
+  R -.->|cache hit, origin not needed| G
 ```
 
-A client walks the graph:
+## Why cachemoney
 
-1. resolve `<repo>.refs` → the branches, tags, and HEAD (or start from a commit
-   SHA with `git clone dns://<sha>`)
-2. fetch each commit's manifest at `<gitsha>.g`, then its chunks
-3. fetch the tree, blobs, and parents the same way, many at once
-4. verify every chunk hash, and every git object's SHA-1, before trusting bytes
+Content-addressed data never changes, so caching it is always correct. A resolver that
+fetched an object once can serve it until the TTL runs out, and the bytes can't drift. Put
+those objects in DNS with long TTLs and every resolver in the path turns into a CDN for
+free.
 
-### Framing
+So every chunk lives at a name derived from its own hash, with a one-day TTL. The only
+mutable record is a repository's ref list at `<repo>.refs.<zone>`, with a 60-second TTL;
+everything it points at is immutable. A client walks the graph from there and checks every
+chunk hash and every git SHA-1 before it trusts a byte.
 
-- A SHA‑256 hash is 64 hex chars — too long for a 63‑char DNS label. We use
-  **base32** (52 chars) instead. Labels are matched case-insensitively.
-- Every record holds at most **512 B** of payload, so every answer fits a
-  1232‑byte EDNS buffer (DNS flag day 2020) for zones up to ~150 characters: a
-  chunk is ~800 B as TXT (base64 in `<seq>:` strings) or ~1075 B as 35 AAAA
-  records. Each AAAA record carries **15 B**; its first byte is a sequence
-  number so resolver reordering can't corrupt data.
-- AAAA payloads start with a 4‑byte length, so trailing padding is never
-  mistaken for content.
-- A manifest too large for one record is stored **indirectly**: the record holds
-  a small manifest (`"indirect": true`) whose chunks reassemble to the real one,
-  nested as needed (at most 16 levels). The object's manifest is still verified
-  against its id.
-- Records carry a one‑day TTL; negative answers are cached for 60 s.
+Git itself never knows any of this happened. It hands `dns://` URLs to the
+`git-remote-dns` helper, and the helper does the walking.
 
-The server answers as a standard authoritative server (SOA/NS at the apex,
-NXDOMAIN, REFUSED outside the zone, EDNS0). The test suite runs it behind a real
-Unbound resolver with 0x20 case randomization and QNAME minimization, including
-serving objects from the resolver's cache with the origin shut down.
+## Requirements
 
-### Cloning a repository over DNS (`git clone dns://<repo>`)
+- **Go 1.27** or later.
+- **git**, for `serve-git` and for cloning.
+- **Unbound**, only if you want to run the recursive-resolver test locally.
 
-Git can clone a repository whose objects are served over DNS instead of HTTP,
-SSH, or SFTP. On demand it spawns a `git-remote-dns` helper; you point the
-helper at a DNS server and the zone to serve, and `git clone dns://<repo>`
-reads the repository's refs and streams back the reachable objects.
+## Install
 
 ```sh
-# Server: publish a repository's branches, tags, and history and serve them,
-# re-reading the repository every 30 s (-refresh)
-cachemoney serve-git -repo path/to/repo -name myrepo -zone example.com -addr 127.0.0.1:5300
+go install github.com/Crank-Git/cachemoney/cmd/cachemoney@latest
+go install github.com/Crank-Git/cachemoney/cmd/git-remote-dns@latest
+```
 
-# Client: clone by name (serve-git prints this command); later pulls fetch
-# only new objects
+`git-remote-dns` has to be on your `PATH`, because that's where git looks for the helper
+when it sees a `dns://` URL. There are no release binaries yet.
+
+## Quick start
+
+Serve a repository from inside its working tree:
+
+```sh
+cd path/to/repo
+cachemoney serve-git -name myrepo -addr 127.0.0.1:5300
+```
+
+`serve-git` publishes every branch and tag plus HEAD, prints the exact clone command, and
+re-reads the repository every 30 seconds. In another terminal, clone it:
+
+```sh
 export GIT_REMOTE_DNS_ZONE=example.com GIT_REMOTE_DNS_SERVER=127.0.0.1:5300
 git clone dns://myrepo
 git -C myrepo pull
-
-# Or clone the history of one commit by SHA
-git clone dns://0123456789abcdef0123456789abcdef01234567
 ```
 
-`serve-git` publishes every branch and tag plus HEAD. Objects go out before
-the ref list that points at them, so a client never sees a ref whose objects
-are missing. A repository name is one lowercase DNS label.
+Later pulls fetch only new objects. To clone the history of one commit instead, use its
+SHA: `git clone dns://<40-character sha>`. The zone defaults to `example.com`; set `-zone`
+on the server and `GIT_REMOTE_DNS_ZONE` on the client to change it.
 
-**Trust.** Every object is verified by its SHA, but the ref list is not
-content-addressed: which commit a branch names is only as trustworthy as the
-DNS path that delivered it (see [Open questions](#open-questions)).
+Every object is verified by its SHA, but the ref list isn't. Which commit a branch names
+is only as trustworthy as the DNS path that delivered it.
 
-From Go, `gitdns.Publish(server, sha, fetch, transport)` publishes a graph given
-a `fetch` that returns an object's raw, uncompressed bytes
-(`"<type> <size>\x00<content>"`, as `git cat-file --batch` provides).
+## Usage
 
-git launches the helper as `git-remote-dns <remote> dns://<repo-or-sha>`. It
-answers:
+`cachemoney` has five subcommands: `put`, `get`, `serve`, `serve-git`, and `fetch`. For
+any blob, store it locally, serve the store, and fetch it back over DNS:
 
-- `list` — the repository's ref list as published (by SHA: that commit as
-  `refs/heads/main` plus a HEAD symref to it).
-- `fetch` — every object reachable from the requested refs that the local
-  repository does not already have, materialized into git's object store via
-  `git unpack-objects` (git's fetch path never consumes the pack the helper
-  emits).
-
-Configuration comes from the environment git passes to helpers:
-
-| Env var | Required | Default | Purpose |
-| --- | --- | --- | --- |
-| `GIT_REMOTE_DNS_ZONE` | yes | — | DNS zone to resolve against |
-| `GIT_REMOTE_DNS_SERVER` | no | `127.0.0.1:5300` | Resolver host:port |
-| `GIT_REMOTE_DNS_TRANSPORT` | no | `txt` | `txt` or `aaaa` |
-| `GIT_REMOTE_DNS_TIMEOUT` | no | `5s` | Resolver timeout |
-| `GIT_REMOTE_DNS_TRACE` | no | unset | Log the helper protocol to stderr |
-
-## Repository layout
-
+```console
+$ cachemoney put hello.txt
+object  A77U4MYEEYZT5SUOQDPQ5ONKM4QJYBU6N5LOVTHDBLXV3RPODGPA
+chunks  1
+bytes   19
+store   .cachemoney
+$ cachemoney serve -addr 127.0.0.1:8845 &
+$ cachemoney fetch -addr 127.0.0.1:8845 A77U4MYEEYZT5SUOQDPQ5ONKM4QJYBU6N5LOVTHDBLXV3RPODGPA
+hello over port 53
 ```
-pkg/objectstore/   content-addressed core: chunking, manifests, TXT/AAAA framing, verify
-pkg/dnszone/       authoritative server (serve) + client resolver (fetch) over UDP/TCP
-pkg/gitobj/        Git object model (commit/tree/blob hashing, graph walk)
-pkg/gitdns/        publish/fetch Git object graphs over DNS
-pkg/pkgindex/      package-file index model
-pkg/mirror/        package index + file transport over DNS (the model for an apt/Nix mirror)
-cmd/cachemoney/    CLI (`put`/`get` a local store, `serve` it, `serve-git` a repository, `fetch` over DNS)
-cmd/git-remote-dns/ git remote helper for `git clone dns://<sha>`
-.github/workflows/ CI (build, gofmt, unit + integration tests incl. Unbound, vet, coverage)
-```
+
+`put` and `get` work on the store in `.cachemoney` (`-store` changes it). `serve`, `serve-git`,
+and `fetch` take `-zone` and `-tr txt|aaaa` to pick the zone and the record type that
+carries the payload.
+
+## Documentation
+
+| Page | What's there |
+|---|---|
+| [Addressing and framing](docs/addressing.md) | Record names, the graph walk, TXT and AAAA framing, TTLs, and server behavior. |
+| [Git over DNS](docs/git-over-dns.md) | `serve-git` flags, the helper protocol, its environment variables, and the Go API. |
+| [Open questions](docs/open-questions.md) | Where the records live and how to trust refs. |
+| [Contributing](CONTRIBUTING.md) | Branch model, CI checks, and repository layout. |
 
 ## Development
 
-Requires Go 1.27+.
-
-```bash
+```sh
 go build ./...
 go test -race -cover ./...
 go vet ./...
 ```
 
-CI runs on every PR and on push to `dev`/`main`: build, `gofmt`, unit +
-integration tests (`-race`, including a recursive-resolver test against
-Unbound), vet, and a coverage gate. Locally the Unbound test is skipped if
-`unbound` is not installed.
-
-## Branch model
-
-Two-branch integration with a PR on every path:
-
-```
-feature ──► dev ──► main
-(short)   (integration)  (stable)
-```
-
-- Feature branches fork off `dev`.
-- PR #1: feature → `dev`. PR #2: `dev` → `main` (merge commit).
-- Both `dev` and `main` are protected: PR required, CI must pass, admins cannot
-  bypass.
-
-See [CONTRIBUTING.md](./CONTRIBUTING.md) for the full workflow.
-
-## Status
-
-All planned work is complete:
-
-1. **Object store core** ✅ — chunking, manifests, TXT/AAAA framing, verification.
-2. **Authoritative DNS layer** ✅ — in-memory nameserver (`serve`) and client resolver (`fetch`) over UDP/TCP.
-3. **Client resolver** ✅ — walks the object graph over DNS with EDNS0 + TCP fallback for truncated answers.
-4. **Git over DNS** ✅ — `gitobj` model, `gitdns` publish/fetch of Git object graphs, `serve-git`, and the `git-remote-dns` helper.
-5. **Package caches** ✅ — `pkgindex` model and `mirror` index/file transport (no apt or Nix protocol front end yet).
-
-## Open questions
-
-- Which TLD/zone hosts the records, and how contributors publish authoritatively.
-- Ref authenticity: refs are the one record not verified by hash. Signed ref
-  lists or DNSSEC would let a client trust which commit a branch names.
+The Unbound test is skipped if `unbound` isn't installed. CI requires it.
 
 ## License
 
-[MIT](./LICENSE)
+MIT. See [LICENSE](LICENSE).
+
+---
+
+<sub>Part of <a href="https://github.com/Crank-Git#things-over-port-53"><b>Things over port 53</b></a>,
+my experiments in what else DNS can carry.
+Siblings: <a href="https://github.com/Crank-Git/epochalypse">epochalypse</a> ·
+<a href="https://github.com/Crank-Git/mcport53">mcport53</a> ·
+<a href="https://github.com/Crank-Git/wingman">wingman</a> ·
+<a href="https://github.com/Crank-Git/llamaoverdns">llamaoverdns</a> ·
+<a href="https://github.com/Crank-Git/dnscalc">dnscalc</a> ·
+Built by <a href="https://github.com/Crank-Git">Crank</a></sub>
