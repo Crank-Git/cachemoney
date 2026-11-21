@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 250" role="img" aria-labelledby="title">
+  <title id="title">cachemoney: a terminal running cachemoney serve-git on a local repository, which answers that it is serving the repository as cachemoney and prints the git clone dns://cachemoney command.</title>
+  <style>
+    text { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; font-size: 21px; }
+    .name { font-size: 50px; font-weight: 700; fill: #e6edf3; }
+    .sub { fill: #8b949e; }
+    .prompt { fill: #7ee787; }
+    .cmd { fill: #e6edf3; }
+    .answer { fill: #ffa657; }
+    .cursor { fill: #7ee787; animation: blink 1.2s steps(2, start) infinite; }
+    @keyframes blink { to { visibility: hidden; } }
+    @media (prefers-reduced-motion: reduce) { .cursor { animation: none; } }
+  </style>
+  <rect x="1" y="1" width="898" height="248" rx="10" fill="#0d1117" stroke="#30363d" stroke-width="2"/>
+  <text class="name" x="36" y="70">cachemoney</text>
+  <text class="sub" x="362" y="68">content-addressed objects over DNS</text>
+  <text x="36" y="118"><tspan class="prompt">$ </tspan><tspan class="cmd">cachemoney serve-git -name cachemoney -addr 127.0.0.1:8844</tspan></text>
+  <text class="answer" x="36" y="152" xml:space="preserve">cachemoney: serving . as cachemoney (1 refs, HEAD 5aa2bb5323…</text>
+  <text class="answer" x="36" y="184" xml:space="preserve">… GIT_REMOTE_DNS_ZONE=example.com … git clone dns://cachemoney</text>
+  <text class="prompt" x="36" y="222">$</text>
+  <rect class="cursor" x="60" y="205" width="12" height="22"/>
+</svg>
